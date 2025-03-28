@@ -7,3 +7,37 @@
 5. API expansion for more flexible integration options
 6. Error handling refinements to make the system more resilient
 7. Source quality assessment to prioritize reliable news sources
+
+
+In the monitor webUI
+
+Where it says Active Location and have the location, let me input location there in the web.
+
+When I do process it and, 
+
+where it is 
+Data Processing Funnel
+Sources Discovered: 15
+Sources Verified: 0
+Articles Fetched: 0
+Articles Validated: 14
+Articles Analyzed: 14
+Articles Stored: 14
+
+On it's right side which is empty right now, add the news  articles as a scrollable compoennt, Like
+
+## Articles (Sorted by Importance & Recency)
+
+### 36 Amazon Big Spring deals our readers are buying like crazy
+* Source: Courier Post | Importance: Medium | Category: Other
+* Published: 2025-03-27 00:00 | Fetched: 2025-03-28 20:47 UTC
+* Summary: Amazon is currently hosting its 2025 Big Spring Sale, offering discounts on a variety of products. The article highlights 36 customer-favorite deals available for purchase through the weekend.
+* URL: https://www.courierpostonline.com/story/shopping/2025/03/27/best-amazon-big-spring-sale-deals/82691686007/
+
+### I'm covering Amazon's spring sale and now I want this $40 electric paint gun
+* Source: MyCentralJersey | Importance: Low | Category: Other
+* Published: 2025-03-28 00:00 | Fetched: 2025-03-28 20:47 UTC
+* Summary: This article highlights a discounted deal on the MirrorZone Paint Sprayer Tool during Amazon's Big Spring Sale. The tool is a popular electric spray paint gun with numerous positive reviews and versatile features.
+* URL: https://www.mycentraljersey.com/story/shopping/2025/03/28/amazon-big-spring-sale-paint-gun-deal/82707384007/
+
+right as it shows in the terminal right now.

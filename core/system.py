@@ -133,7 +133,7 @@ class NewsAggregationSystem:
         # Use the global metrics_collector
         global metrics_collector
         logger.info(f"===== Processing Location: {location} =====")
-        metrics_collector.update_system_status("Processing", location=location)
+        await metrics_collector.update_system_status("Processing", location=location)
 
         metrics_collector.snapshot_resources() # Initial resource usage
         process_start_time = time.monotonic()
@@ -153,9 +153,9 @@ class NewsAggregationSystem:
             if not sources:
                 msg = f"No verifiable sources discovered for '{location}'."
                 logger.warning(msg)
-                metrics_collector.log_event(logging.WARNING, __name__, msg, {"location": location})
+                logger.warning(f"No verifiable sources discovered for '{location}'")
                 final_presentation = f"No verifiable news sources found for {location}."
-                metrics_collector.update_system_status("Idle")
+                await metrics_collector.update_system_status("Idle")
                 # Finalize and log summary on early exit
                 total_duration = time.monotonic() - process_start_time
                 metrics_collector.record_processing_time(total_duration)
@@ -173,7 +173,7 @@ class NewsAggregationSystem:
 
             if not new_articles:
                  logger.warning(f"No new articles fetched for '{location}'. Checking database...")
-                 metrics_collector.log_event(logging.WARNING, __name__, "No new articles fetched.", {"location": location})
+                 logger.warning(f"No new articles fetched for '{location}'")
                  # ... (DB check logic - record timing for it) ...
                  stage_start_db = time.monotonic()
                  existing_articles = await self.storage_agent.get_articles_by_location(location, limit=25)
@@ -183,10 +183,9 @@ class NewsAggregationSystem:
                       articles_to_present = existing_articles
                       note = "\n\n(Note: Displaying stored articles; no new ones fetched.)"
                  else:
-                      # ... (Handle no articles found) ...
-                      metrics_collector.log_event(logging.WARNING, __name__, "No stored articles found either.", {"location": location})
+                      logger.warning(f"No stored articles found for '{location}'")
                       final_presentation = f"No articles found for {location}."
-                      metrics_collector.update_system_status("Idle")
+                      await metrics_collector.update_system_status("Idle")
                       total_duration = time.monotonic() - process_start_time
                       metrics_collector.record_processing_time(total_duration)
                       logger.warning(f"Summary for '{location}' (no articles):\n{metrics_collector.get_initial_data()}") # Log snapshot
@@ -225,17 +224,64 @@ class NewsAggregationSystem:
 
         except Exception as e:
             logger.critical(f"!!! Critical error processing '{location}': {e}", exc_info=True)
-            metrics_collector.log_event(logging.CRITICAL, __name__, f"Critical system error: {e}", {"location": location})
+            logger.critical(f"Critical system error processing '{location}': {e}")
             final_presentation = f"An unexpected error occurred while processing {location}. Check logs."
 
         finally:
             total_duration = time.monotonic() - process_start_time
             metrics_collector.record_processing_time(total_duration)
-            metrics_collector.update_system_status("Idle") # Reset status
+            await metrics_collector.update_system_status("Idle") # Reset status
             logger.info(f"===== Finished Processing {location} in {total_duration:.2f} seconds =====")
-            # Log snapshot at end of processing
-            logger.info(f"Final metrics snapshot for '{location}':\n{metrics_collector.get_initial_data()}")
+            logger.info(f"Final metrics summary for '{location}':\n{self._format_metrics_summary(location)}")
             final_presentation += f"\n\n(Processing time: {total_duration:.2f} seconds)"
             pass
 
         return final_presentation
+    
+    def _format_metrics_summary(self, location: str) -> str:
+        """Creates a concise summary of the metrics for logging."""
+        funnel = metrics_collector.funnel_counts
+        timings = {}
+        
+        # Get stage timings if available
+        with metrics_collector._lock:
+            if hasattr(metrics_collector, 'stage_timings'):
+                timings = metrics_collector.stage_timings
+        
+        summary = [
+            f"===== Metrics Summary for {location} =====",
+            f"Processing Pipeline:",
+            f"  Sources: discovered={funnel.get('sources_discovered', 0)}, verified={funnel.get('sources_verified', 0)}",
+            f"  Articles: fetched={funnel.get('articles_fetched', 0)}, validated={funnel.get('articles_validated', 0)}, analyzed={funnel.get('articles_analyzed', 0)}, stored={funnel.get('articles_stored', 0)}",
+            f"  From DB: {funnel.get('articles_from_db', 0)}",
+            f"  Errors: {funnel.get('errors', 0)}"
+        ]
+        
+        # Add processing time summary
+        if timings:
+            summary.append("\nStage Timings (seconds):")
+            for stage, duration in timings.items():
+                summary.append(f"  - {stage}: {duration:.2f}s")
+        
+        # Add latest LLM metrics if available
+        llm_metrics = {}
+        with metrics_collector._lock:
+            if hasattr(metrics_collector, 'llm_metrics'):
+                for key, metric in metrics_collector.llm_metrics.items():
+                    llm_metrics[key] = f"calls={metric.call_count}, errors={metric.error_count}, avg_latency={round(metric.avg_latency() * 1000) if metric.avg_latency() is not None else 'N/A'}ms"
+        
+        if llm_metrics:
+            summary.append("\nLLM Usage:")
+            for model, stats in llm_metrics.items():
+                summary.append(f"  - {model}: {stats}")
+        
+        # Add resource usage if available
+        with metrics_collector._lock:
+            if hasattr(metrics_collector, 'resource_snapshots') and metrics_collector.resource_snapshots:
+                latest = metrics_collector.resource_snapshots[-1]
+                cpu = latest.get('cpu', 'N/A')
+                memory = latest.get('memory_percent', 'N/A')
+                summary.append(f"\nResource Usage (Latest): CPU {cpu}%, Memory {memory}%")
+        
+        summary.append("=" * 35)
+        return "\n".join(summary)

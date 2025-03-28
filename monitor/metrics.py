@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import json
 import threading
 from weakref import WeakSet # To hold WebSocket connections without preventing cleanup
+from fastapi import WebSocket
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +16,6 @@ logger = logging.getLogger(__name__)
 MAX_METRIC_POINTS = 360 # e.g., 60 minutes at 1 point per 10 seconds
 MAX_LOG_ENTRIES = 250 # Increased slightly
 MAX_ERROR_ENTRIES = 100
-# MAX_AGENT_STATUS_UPDATES = 50 # Not strictly limited this way anymore
 
 @dataclass
 class TimeSeriesData:
@@ -69,6 +69,15 @@ class MetricsCollector:
         # Agent Status - {agent_id: status_dict}
         self.agent_status: Dict[str, Dict[str, Any]] = {}
 
+        # Add agent status tracking
+        self.agent_status = {
+            "discovery": {"status": "Idle", "last_update": time.time()},
+            "crawling": {"status": "Idle", "last_update": time.time()},
+            "analysis": {"status": "Idle", "last_update": time.time()},
+            "organization": {"status": "Idle", "last_update": time.time()},
+            "storage": {"status": "Idle", "last_update": time.time()}
+        }
+
         # LLM Metrics - {"provider/model": LLMMetrics}
         self.llm_metrics: Dict[str, LLMMetrics] = {}
 
@@ -92,40 +101,57 @@ class MetricsCollector:
         self._loop = loop
         logger.info("Main event loop set for MetricsCollector.")
 
-    async def register_websocket(self, websocket: Any):
+    async def register_websocket(self, websocket: WebSocket):
         """Adds a WebSocket connection to the set."""
         self.websocket_connections.add(websocket)
         logger.info(f"WebSocket registered. Total connections: {len(self.websocket_connections)}")
 
-    def unregister_websocket(self, websocket: Any):
+    def unregister_websocket(self, websocket: WebSocket):
         """Removes a WebSocket connection."""
-        # This method might be called from an exception handler in the websocket endpoint,
-        # so it should be relatively safe (no heavy locking needed just for discard).
         self.websocket_connections.discard(websocket)
         logger.info(f"WebSocket unregistered. Total connections: {len(self.websocket_connections)}")
 
-    async def broadcast(self, message: Dict[str, Any]):
+    async def broadcast(self, message_type: str, data: Dict[str, Any]):
         """Sends a JSON message to all connected WebSocket clients."""
         if not self.websocket_connections:
             return
 
         try:
-            message_json = json.dumps(message) # Prepare JSON once
+            message_json = json.dumps({"type": message_type, "data": data}) # Prepare JSON once
         except Exception as e:
-            logger.error(f"Failed to serialize broadcast message: {e} - Message: {message}", exc_info=True)
+            logger.error(f"Failed to serialize broadcast message: {e} - Data: {data}", exc_info=True)
             return
 
-        # Use gather to send concurrently, collecting potential exceptions
-        tasks = [conn.send_text(message_json) for conn in self.websocket_connections]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        dead_sockets = set()
+        for websocket in self.websocket_connections:
+            try:
+                await websocket.send_text(message_json)
+            except Exception as e:
+                logger.error(f"Failed to send to websocket: {e}")
+                dead_sockets.add(websocket)
 
-        # Log errors without trying complex removal logic here
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.warning(f"Error broadcasting to a WebSocket client: {result}")
-                # Potential improvement: If specific connection info is available, log it.
+        # Clean up any dead connections
+        for dead_socket in dead_sockets:
+            self.websocket_connections.discard(dead_socket)
 
-    # --- Data Collection Methods (Thread-Safe where needed) ---
+    async def update_agent_status(self, agent_id: str, status: str, details: Optional[Dict[str, Any]] = None):
+        """Update the status of an agent and broadcast the change."""
+        now = time.time()
+
+        # Create a status object
+        status_obj = {
+            "name": agent_id,
+            "task": status,
+            "context": str(details) if details else "",
+            "timestamp": now,
+            "duration": 0  # Will be calculated on the client side
+        }
+
+        # Save to internal state
+        self.agent_status[agent_id] = status_obj
+
+        # Broadcast the update
+        await self.broadcast("agent_status", {agent_id: status_obj})
 
     def log_event_sync(self, level: int, name: str, message: str, context: Optional[Dict] = None):
         """
@@ -165,17 +191,25 @@ class MetricsCollector:
             logger.warning("Event loop not set for broadcasting log entry.")
         # else: loop exists but isn't running (e.g., during shutdown)
 
+    async def log_event(self, level: int, name: str, message: str, context: Optional[Dict] = None):
+        """Async wrapper for log_event_sync that also broadcasts the log."""
+        # First call the sync version to record the log
+        self.log_event_sync(level, name, message, context)
+        
+        # If this is an error level or higher, try to broadcast it immediately
+        if level >= logging.ERROR:
+            log_entry = self.error_history[-1] if self.error_history else None
+            if log_entry:
+                await self._broadcast_log_entry(log_entry, is_error=True)
+
     async def _broadcast_log_entry(self, log_entry: Dict, is_error: bool):
         """Async helper to broadcast log/error entries."""
-        await self.broadcast({"type": "log", "payload": log_entry})
+        await self.broadcast("log", log_entry)
         if is_error:
-            await self.broadcast({"type": "error", "payload": log_entry})
+            await self.broadcast("error", log_entry)
 
     async def update_system_status(self, status: str, location: Optional[str] = None):
          """Async method to update system status and broadcast."""
-         # Location update might need locking if accessed/modified by multiple tasks concurrently
-         # But typically only the main processing task updates it.
-         # Let's assume status/location updates are primarily from the main async flow for now.
          should_broadcast = False
          with self._lock:
              if status != self.system_status:
@@ -187,11 +221,7 @@ class MetricsCollector:
 
          if should_broadcast:
              payload = {"status": self.system_status, "active_location": self.active_location}
-             await self.broadcast({"type": "system_status", "payload": payload})
-
-    # --- Methods primarily called from the main async loop ---
-    # --- These don't strictly need locking if only called by main loop/tasks ---
-    # --- but adding locks makes them safer if that assumption changes ---
+             await self.broadcast("system_status", payload)
 
     def update_system_status_threadsafe(self, status: str):
          """
@@ -202,18 +232,15 @@ class MetricsCollector:
          if self._loop and self._loop.is_running():
               self._loop.call_soon_threadsafe(
                    asyncio.create_task,
-                   # Call the main async update method
                    self.update_system_status(status) # Location won't be updated here
               )
-
 
     def record_processing_time(self, duration: float):
         """Records a completed location processing duration."""
         with self._lock:
             self.processing_time_hist.append(duration)
             payload = {"duration": duration}
-        # Schedule broadcast from main loop is simpler
-        asyncio.create_task(self.broadcast({"type": "processing_time", "payload": payload}))
+        asyncio.create_task(self.broadcast("processing_time", payload))
 
     def record_stage_timing(self, stage_name: str, duration: float):
         """Records timing for a specific stage."""
@@ -221,52 +248,18 @@ class MetricsCollector:
         with self._lock:
             stage_deque = self.stage_timings_agg[stage_name]
             stage_deque.append(duration)
-            # Calculate average inside lock for consistency
             avg_duration = sum(stage_deque) / len(stage_deque) if stage_deque else 0
             payload = {"stage": stage_name, "duration": duration, "avg_last_50": avg_duration}
-        asyncio.create_task(self.broadcast({"type": "stage_timing", "payload": payload}))
+        asyncio.create_task(self.broadcast("stage_timing", payload))
 
     def increment_funnel_count(self, stage_key: str, value: int = 1):
         """Increments counts for the data processing funnel."""
         with self._lock:
             self.funnel_counts[stage_key] += value
-            current_counts = self.funnel_counts.copy() # Copy inside lock
+            current_counts = self.funnel_counts.copy()
             if stage_key == "articles_validated":
                 self._articles_in_interval += value
-        asyncio.create_task(self.broadcast({"type": "funnel_update", "payload": current_counts}))
-
-    def update_agent_status(self, agent_id: str, name: str, task: str, context: Optional[str] = None):
-        """Updates the status of a specific agent instance."""
-        now = time.time()
-        status_copy = {}
-        with self._lock:
-            status = self.agent_status.get(agent_id)
-            if status is None:
-                status = {"start_time": now}
-                self.agent_status[agent_id] = status
-
-            last_task = status.get("_last_task")
-            # Reset start time when task changes
-            if last_task != task:
-                status["start_time"] = now
-                status["duration"] = 0
-            else: # Calculate duration since task started
-                 status["duration"] = now - status["start_time"]
-
-            status.update({
-                "name": name,
-                "task": task,
-                "context": context,
-                "timestamp": now,
-                "_last_task": task # Store last task for comparison
-            })
-            status_copy = status.copy() # Copy inside lock
-
-        # Schedule broadcast
-        asyncio.create_task(self.broadcast({
-            "type": "agent_status",
-            "payload": {"agent_id": agent_id, "status": status_copy}
-        }))
+        asyncio.create_task(self.broadcast("funnel_update", current_counts))
 
     def record_llm_call(self, provider: str, model: str, latency: float, is_error: bool):
         """Records details about an LLM API call."""
@@ -281,24 +274,19 @@ class MetricsCollector:
             if is_error:
                 metric.error_count += 1
             else:
-                # Only store latency for successful calls
                 metric.latencies.append(latency)
 
-            # Calculate summary inside lock for consistency
             summary = {
                 "provider": provider, "model": model,
                 "calls": metric.call_count, "errors": metric.error_count,
                 "avg_latency_ms": round(metric.avg_latency() * 1000) if metric.avg_latency() is not None else None,
                 "error_rate_pct": round(metric.error_rate(), 1)
             }
-        # Schedule broadcast
-        asyncio.create_task(self.broadcast({"type": "llm_metric", "payload": summary}))
+        asyncio.create_task(self.broadcast("llm_metric", summary))
 
     def snapshot_resources(self):
         """Takes a snapshot of current CPU and Memory usage (called from main loop)."""
-        # No broadcast needed here; _monitor_resources handles periodic broadcast
         try:
-             # Update deques within lock
              with self._lock:
                   cpu = psutil.cpu_percent(interval=None)
                   mem = psutil.virtual_memory().percent
@@ -310,8 +298,6 @@ class MetricsCollector:
         except Exception as e:
             logger.warning(f"Failed to capture resource usage snapshot: {e}")
 
-
-    # --- Background Tasks ---
     async def _monitor_resources(self):
         """Periodically captures CPU/Memory and broadcasts."""
         logger.info("Resource monitor background task started.")
@@ -322,20 +308,18 @@ class MetricsCollector:
                     cpu = psutil.cpu_percent(interval=None)
                     mem = psutil.virtual_memory().percent
                     ts = time.time()
-                    # Append to deques AND prepare payload for broadcast
                     self.resource_cpu.timestamps.append(ts)
                     self.resource_cpu.values.append(cpu)
                     self.resource_memory.timestamps.append(ts)
                     self.resource_memory.values.append(mem)
                     payload = {"timestamp": ts, "cpu_percent": cpu, "memory_percent": mem}
 
-                # Broadcast outside lock
                 if payload:
-                    await self.broadcast({"type": "resource_update", "payload": payload})
+                    await self.broadcast("resource_update", payload)
             except Exception as e:
                 logger.warning(f"Resource monitoring error: {e}")
 
-            await asyncio.sleep(5) # Interval
+            await asyncio.sleep(5)
 
     async def _aggregate_rates(self):
          """Periodically calculates and broadcasts event rates."""
@@ -346,17 +330,14 @@ class MetricsCollector:
              payload = {}
              try:
                  with self._lock:
-                     # Articles processed rate
                      current_articles = self._articles_in_interval
                      articles_rate = current_articles / self._rate_interval_seconds
                      self.articles_processed_rate.timestamps.append(ts)
                      self.articles_processed_rate.values.append(articles_rate)
-                     self._articles_in_interval = 0 # Reset counter
+                     self._articles_in_interval = 0
 
-                     # Error rate (approximate based on recent history)
-                     error_threshold_ts = ts - self._rate_interval_seconds * 1.5 # Look slightly further back
+                     error_threshold_ts = ts - self._rate_interval_seconds * 1.5
                      current_errors = sum(1 for e in self.error_history if e['timestamp'] > error_threshold_ts)
-                     # Calculate rate based on actual window duration used for count
                      error_rate = current_errors / self._rate_interval_seconds
 
                      self.errors_per_interval.timestamps.append(ts)
@@ -367,11 +348,9 @@ class MetricsCollector:
                          "articles_per_sec": articles_rate,
                          "errors_per_sec": error_rate
                      }
-                 # Broadcast outside lock
-                 await self.broadcast({"type": "rate_update", "payload": payload})
+                 await self.broadcast("rate_update", payload)
              except Exception as e:
                   logger.warning(f"Rate aggregation error: {e}")
-
 
     async def start_background_tasks(self):
         """Starts the periodic monitoring tasks."""
@@ -398,19 +377,15 @@ class MetricsCollector:
              logger.info("Stopping rate aggregation task...")
 
         if tasks_to_stop:
-             await asyncio.gather(*tasks_to_stop, return_exceptions=True) # Wait for cancellation
+             await asyncio.gather(*tasks_to_stop, return_exceptions=True)
              logger.info("Background tasks stopped.")
         self.resource_monitor_task = None
         self.rate_aggregator_task = None
 
-
-    # --- Data Access for Initial Load ---
     def get_initial_data(self) -> Dict[str, Any]:
         """Returns a snapshot of current data for new client connections (thread-safe)."""
-        # Ensure lock is acquired for consistency
         with self._lock:
             try:
-                # Create copies of mutable data structures *inside* lock
                 llm_metrics_summary = [
                      {
                          "provider": m.provider, "model": m.model,
@@ -419,7 +394,6 @@ class MetricsCollector:
                          "error_rate_pct": round(m.error_rate(), 1)
                      } for m in self.llm_metrics.values()
                 ]
-                # Ensure all data is serializable *before* releasing lock
                 initial_data = {
                     "system_status": {"status": self.system_status, "active_location": self.active_location},
                     "resources": {
@@ -437,22 +411,17 @@ class MetricsCollector:
                     "errors": list(self.error_history),
                     "llm_metrics": llm_metrics_summary
                 }
-                # Perform a quick self-check serialization here if needed
-                _ = json.dumps(initial_data, default=str) # Test serialization with fallback
+                _ = json.dumps(initial_data, default=str)
                 logger.debug("Successfully prepared initial data snapshot.")
                 return initial_data
             except Exception as e:
-                 logger.error(f"!!! Failed to prepare or serialize initial_data within get_initial_data: {e}", exc_info=True)
-                 # Log the problematic structure as best as possible
-                 logger.error(f"Problematic data state (partial): {str(self.__dict__)[:2000]}") # Log internal state
-                 # Return a safe default indicating error
+                 logger.error(f"Failed to prepare or serialize initial_data within get_initial_data: {e}", exc_info=True)
+                 logger.error(f"Problematic data state (partial): {str(self.__dict__)[:2000]}")
                  return {"system_status": {"status": "Error - Data Serialization Failed"}}
 
 
-# --- Global Instance ---
 metrics_collector = MetricsCollector()
 
-# --- Custom Log Handler ---
 class MetricsLogHandler(logging.Handler):
     """Custom handler to forward logs to the MetricsCollector (using sync method)."""
     def __init__(self, collector: MetricsCollector, level=logging.NOTSET):
@@ -460,14 +429,11 @@ class MetricsLogHandler(logging.Handler):
         self.collector = collector
 
     def emit(self, record: logging.LogRecord):
-        # Avoid self-logging loops from monitor/server components
         if record.name.startswith('monitor.') or record.name.startswith('uvicorn') or record.name.startswith('websockets'):
              return
         try:
-            context = {} # Placeholder for potential future context extraction
+            context = {}
             message = self.format(record)
-            # Call the synchronous part of the collector safely
             self.collector.log_event_sync(record.levelno, record.name, message, context)
         except Exception:
-            # Use standard logging error handling if emit fails
             self.handleError(record)

@@ -21,3 +21,9 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", "./data/news_archive.db")
 
 # App Settings
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "UTC") # Default to UTC if not set
+
+# Crawling settings
+MAX_CONTENT_SIZE_MB = 10  # Maximum content size in MB
+CRAWL_TIMEOUT_SECONDS = 30  # Timeout for requests
+MAX_RETRY_ATTEMPTS = 2  # Number of retry attempts for failed fetches
+RETRY_DELAY_SECONDS = 1  # Delay between retries

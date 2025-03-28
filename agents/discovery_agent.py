@@ -1,3 +1,4 @@
+# discovery_agent.py
 import logging
 import json
 import re
@@ -9,13 +10,15 @@ import aiohttp # Needed for URL verification
 from models.data_models import NewsSource
 # Assuming LLM provider base/interface is in ../llm_providers/
 from llm_providers.base import LLMProvider
+from agents.base_agent import BaseAgent  # Import BaseAgent
 
 logger = logging.getLogger(__name__)
 
-class NewsSourceDiscoveryAgent:
+class NewsSourceDiscoveryAgent(BaseAgent):
     """Agent responsible for discovering and verifying news sources."""
 
     def __init__(self, llm_provider: LLMProvider, session: Optional[aiohttp.ClientSession] = None):
+        super().__init__("source_discovery")  # Initialize the BaseAgent
         self.llm_provider = llm_provider
         # Use a shared session if provided for efficiency, or manage internally
         self._session = session
@@ -34,6 +37,7 @@ class NewsSourceDiscoveryAgent:
 
     async def close_internal_session(self):
         """Closes the internally created aiohttp session if it exists and was created here."""
+        await self._update_status_async("Closing session")  # Using async version
         if self._created_session and self._session and not self._session.closed:
             await self._session.close()
             self._session = None
@@ -42,6 +46,7 @@ class NewsSourceDiscoveryAgent:
 
     async def _verify_source_url(self, url: str, timeout: int = 15) -> bool:
         """Quickly checks if a URL seems reachable using a HEAD request."""
+        await self._update_status_async("Verifying URL", {"url": url})  # Using async version
         if not url or not url.startswith(('http://', 'https://')):
             logger.warning(f"Invalid URL format for verification: {url}")
             return False
@@ -76,6 +81,7 @@ class NewsSourceDiscoveryAgent:
 
     async def discover_sources(self, location: str, limit: int = 10) -> List[NewsSource]:
         """Discover top news sources via LLM and verify their URLs."""
+        await self._update_status_async("Discovering sources", {"location": location, "limit": limit})  # Using async version
         logger.info(f"Discovering top {limit} sources for '{location}'...")
         # Prompt definition (ensure it requests accurate URLs)
         prompt = f"""
