@@ -1,4 +1,3 @@
-# ollama.py
 import logging
 import json
 import asyncio
@@ -82,63 +81,63 @@ class OllamaLLM(LLMProvider):
         retries = 0
         last_error = None
 
-        try:
-            while retries <= self.max_retries:
-                if retries > 0:
-                    wait_time = self.retry_delay * retries  # Increasing backoff
-                    logger.info(f"Retrying Ollama request (attempt {retries}/{self.max_retries}) after {wait_time:.1f}s")
-                    await asyncio.sleep(wait_time)
-                
-                try:
-                    session = await self._get_session()
-                    async with session.post(
-                        self.api_endpoint, 
-                        headers=headers, 
-                        json=data,
-                        raise_for_status=False  # Handle HTTP errors ourselves
-                    ) as response:
-                        if response.status == 200:
-                            try:
-                                result = await response.json()
-                                response_text = result.get("response", "").strip()
-                                if not response_text:
-                                    logger.warning("Ollama returned empty response with status 200")
-                                    last_error = ValueError("Empty response from Ollama")
-                                    retries += 1
-                                    continue
-                                    
-                                is_error = False  # Success!
-                                logger.debug(f"Ollama Response received (len={len(response_text)})")
-                                break  # Exit retry loop on success
-                            except (json.JSONDecodeError, KeyError) as e:
-                                last_error = e
-                                logger.error(f"Failed parsing Ollama success response: {e}", exc_info=True)
+        while retries <= self.max_retries:
+            if retries > 0:
+                wait_time = self.retry_delay * retries  # Increasing backoff
+                logger.info(f"Retrying Ollama request (attempt {retries}/{self.max_retries}) after {wait_time:.1f}s")
+                await asyncio.sleep(wait_time)
+            
+            try:
+                session = await self._get_session()
+                async with session.post(
+                    self.api_endpoint, 
+                    headers=headers, 
+                    json=data,
+                    raise_for_status=False  # Handle HTTP errors ourselves
+                ) as response:
+                    if response.status == 200:
+                        try:
+                            result = await response.json()
+                            response_text = result.get("response", "").strip()
+                            if not response_text:
+                                logger.warning("Ollama returned empty response with status 200")
+                                last_error = ValueError("Empty response from Ollama")
                                 retries += 1
-                                # Try again if retries remain
-                        elif response.status == 408 or response.status >= 500:
-                            # Server errors or timeouts are candidates for retry
-                            error_body = await response.text()
-                            last_error = Exception(f"Ollama API Error ({response.status}): {error_body[:100]}...")
-                            logger.warning(f"Retryable Ollama error: {response.status}")
-                            retries += 1
-                        else:
-                            # Client errors (4xx except 408) are not retried
-                            error_body = await response.text()
-                            last_error = Exception(f"Ollama API Error ({response.status}): {error_body[:100]}...")
-                            logger.error(f"Non-retryable Ollama API Error ({response.status}): {error_body[:500]}...")
-                            break  # Exit retry loop, won't retry client errors
-                except aiohttp.ClientConnectorError as e:
-                    last_error = e
-                    logger.error(f"Connection failed to Ollama at {self.api_endpoint}: {e}")
-                    retries += 1  # Connection errors are retriable
-                except asyncio.TimeoutError:
-                    last_error = asyncio.TimeoutError(f"Request timed out after {self.request_timeout}s")
-                    logger.error(f"Ollama request timed out after {self.request_timeout}s (model: {self.model}).")
-                    retries += 1  # Timeouts are retriable
-                except Exception as e:
-                    last_error = e
-                    logger.error(f"Unexpected error calling Ollama API: {e}", exc_info=True)
-                    retries += 1  # Other errors are retriable, but might be futile
+                                continue
+                                
+                            is_error = False  # Success!
+                            logger.debug(f"Ollama Response received (len={len(response_text)})")
+                            break  # Exit retry loop on success
+                        except (json.JSONDecodeError, KeyError) as e:
+                            last_error = e
+                            logger.error(f"Failed parsing Ollama success response: {e}", exc_info=True)
+                            # Try again if retries remain
+                    elif response.status == 408 or response.status >= 500:
+                        # Server errors or timeouts are candidates for retry
+                        error_body = await response.text()
+                        last_error = Exception(f"Ollama API Error ({response.status}): {error_body[:100]}...")
+                        logger.warning(f"Retryable Ollama error: {response.status}")
+                        retries += 1
+                    else:
+                        # Client errors (4xx except 408) are not retried
+                        error_body = await response.text()
+                        last_error = Exception(f"Ollama API Error ({response.status}): {error_body[:100]}...")
+                        logger.error(f"Non-retryable Ollama API Error ({response.status}): {error_body[:500]}...")
+                        break  # Exit retry loop, won't retry client errors
+
+            except aiohttp.ClientConnectorError as e:
+                last_error = e
+                logger.error(f"Connection failed to Ollama at {self.api_endpoint}: {e}")
+                retries += 1  # Connection errors are retriable
+            except asyncio.TimeoutError:
+                last_error = asyncio.TimeoutError(f"Request timed out after {self.request_timeout}s")
+                logger.error(f"Ollama request timed out after {self.request_timeout}s (model: {self.model}).")
+                retries += 1  # Timeouts are retriable
+            except Exception as e:
+                last_error = e
+                logger.error(f"Unexpected error calling Ollama API: {e}", exc_info=True)
+                retries += 1  # Other errors are retriable, but might be futile
+        
         finally:
             latency = time.monotonic() - start_time
             metrics_collector.record_llm_call(

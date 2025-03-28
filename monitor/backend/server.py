@@ -1,7 +1,8 @@
 import logging
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 import asyncio
 
 # Import the global metrics collector instance
@@ -35,6 +36,35 @@ async def websocket_endpoint(websocket: WebSocket):
 async def get_initial_data():
     logger.debug("Serving initial data request.")
     return metrics_collector.get_initial_data()
+
+# --- Location Processing API Endpoint ---
+class LocationRequest(BaseModel):
+    location: str
+
+@app.post("/api/process_location")
+async def process_location(request: LocationRequest):
+    """Process a location and start gathering news for it."""
+    if not request.location or not request.location.strip():
+        raise HTTPException(status_code=400, detail="Location cannot be empty")
+    
+    try:
+        logger.info(f"Received request to process location: {request.location}")
+        
+        # Check if we have a reference to the news system
+        if not hasattr(metrics_collector, 'news_system') or not metrics_collector.news_system:
+            raise HTTPException(status_code=503, detail="News processing system not available")
+            
+        # Process the location asynchronously
+        asyncio.create_task(metrics_collector.process_news_location(request.location))
+        
+        return {
+            "status": "processing",
+            "location": request.location,
+            "message": f"Started processing location: {request.location}"
+        }
+    except Exception as e:
+        logger.error(f"Error processing location '{request.location}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing location: {str(e)}")
 
 # --- Serve Frontend Files ---
 # Mount static files (JS, CSS)

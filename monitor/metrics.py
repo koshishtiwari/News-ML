@@ -66,20 +66,25 @@ class MetricsCollector:
         self.log_history: Deque[Dict[str, Any]] = deque(maxlen=MAX_LOG_ENTRIES)
         self.error_history: Deque[Dict[str, Any]] = deque(maxlen=MAX_ERROR_ENTRIES)
 
+        # Article Storage
+        self.current_articles: List[Dict[str, Any]] = []
+
         # Agent Status - {agent_id: status_dict}
         self.agent_status: Dict[str, Dict[str, Any]] = {}
-
         # Add agent status tracking
         self.agent_status = {
-            "discovery": {"status": "Idle", "last_update": time.time()},
-            "crawling": {"status": "Idle", "last_update": time.time()},
-            "analysis": {"status": "Idle", "last_update": time.time()},
-            "organization": {"status": "Idle", "last_update": time.time()},
-            "storage": {"status": "Idle", "last_update": time.time()}
+            "source_discovery": {"name": "Source Discovery", "task": "Idle", "context": "", "timestamp": time.time(), "duration": 0},
+            "crawling": {"name": "Crawling", "task": "Idle", "context": "", "timestamp": time.time(), "duration": 0},
+            "analysis": {"name": "Analysis", "task": "Idle", "context": "", "timestamp": time.time(), "duration": 0},
+            "organization": {"name": "Organization", "task": "Idle", "context": "", "timestamp": time.time(), "duration": 0},
+            "storage": {"name": "Storage", "task": "Idle", "context": "", "timestamp": time.time(), "duration": 0}
         }
 
         # LLM Metrics - {"provider/model": LLMMetrics}
         self.llm_metrics: Dict[str, LLMMetrics] = {}
+
+        # News system reference (set externally)
+        self.news_system = None
 
         # --- WebSocket Management ---
         self.websocket_connections: WeakSet = WeakSet() # Use WeakSet
@@ -100,6 +105,11 @@ class MetricsCollector:
         """Stores the main event loop for threadsafe scheduling."""
         self._loop = loop
         logger.info("Main event loop set for MetricsCollector.")
+
+    def set_news_system(self, news_system):
+        """Store reference to the news aggregation system for processing locations."""
+        self.news_system = news_system
+        logger.info("News system reference set in metrics collector")
 
     async def register_websocket(self, websocket: WebSocket):
         """Adds a WebSocket connection to the set."""
@@ -138,20 +148,37 @@ class MetricsCollector:
         """Update the status of an agent and broadcast the change."""
         now = time.time()
 
+        # Format the context as a readable string if it's a dictionary
+        context_str = ""
+        if details:
+            if isinstance(details, dict):
+                context_str = ", ".join(f"{k}={v}" for k, v in details.items())
+            else:
+                context_str = str(details)
+
+        # Get previous timestamp if available to calculate duration
+        prev_timestamp = self.agent_status.get(agent_id, {}).get("timestamp", now)
+        duration = now - prev_timestamp if status != self.agent_status.get(agent_id, {}).get("task") else 0
+
+        # Make sure we have a proper display name
+        agent_name = agent_id.replace('_', ' ').title()
+
         # Create a status object
         status_obj = {
-            "name": agent_id,
+            "name": agent_name,
             "task": status,
-            "context": str(details) if details else "",
+            "context": context_str,
             "timestamp": now,
-            "duration": 0  # Will be calculated on the client side
+            "duration": duration
         }
 
         # Save to internal state
         self.agent_status[agent_id] = status_obj
 
-        # Broadcast the update
-        await self.broadcast("agent_status", {agent_id: status_obj})
+        # Broadcast the update with the correct format for the frontend
+        await self.broadcast("agent_status", {"agent_id": agent_id, "status": status_obj})
+
+        logger.debug(f"Agent {agent_id} status updated: {status} - {context_str}")
 
     def log_event_sync(self, level: int, name: str, message: str, context: Optional[Dict] = None):
         """
@@ -409,7 +436,8 @@ class MetricsCollector:
                     "agent_status": self.agent_status.copy(),
                     "logs": list(self.log_history),
                     "errors": list(self.error_history),
-                    "llm_metrics": llm_metrics_summary
+                    "llm_metrics": llm_metrics_summary,
+                    "articles": self.current_articles
                 }
                 _ = json.dumps(initial_data, default=str)
                 logger.debug("Successfully prepared initial data snapshot.")
@@ -418,6 +446,62 @@ class MetricsCollector:
                  logger.error(f"Failed to prepare or serialize initial_data within get_initial_data: {e}", exc_info=True)
                  logger.error(f"Problematic data state (partial): {str(self.__dict__)[:2000]}")
                  return {"system_status": {"status": "Error - Data Serialization Failed"}}
+
+    async def update_articles(self, articles):
+        """Update the current articles and broadcast them to all connected clients."""
+        with self._lock:
+            self.current_articles = articles
+        
+        # Broadcast the updated article list
+        await self.broadcast("articles_update", {"articles": articles})
+        logger.info(f"Updated and broadcast {len(articles)} articles")
+
+    async def process_news_location(self, location: str):
+        """Process a news location and update articles in real-time."""
+        if not self.news_system:
+            logger.error("Cannot process location: news system reference not set")
+            return
+        
+        try:
+            # Update status to show we're processing
+            await self.update_system_status("Processing", location)
+            
+            # Reset funnel counts
+            with self._lock:
+                self.funnel_counts = defaultdict(int)
+            await self.broadcast("funnel_update", self.funnel_counts)
+            
+            # Clear current articles
+            await self.update_articles([])
+            
+            # Process the location with the news system
+            # This will update metrics and funnel counts automatically
+            result = await self.news_system.process_location(location)
+            
+            # The news system should have updated all metrics during processing
+            # We can get the final articles from the storage agent
+            if hasattr(self.news_system, 'storage_agent'):
+                articles = await self.news_system.storage_agent.get_articles_by_location(location, limit=100)
+                article_dicts = []
+                for article in articles:
+                    # Convert article objects to dictionaries for JSON serialization
+                    article_dict = article.__dict__ if hasattr(article, '__dict__') else {}
+                    # Clean up any non-serializable attributes
+                    for k in list(article_dict.keys()):
+                        if k.startswith('_') or not isinstance(article_dict[k], (str, int, float, bool, list, dict, type(None))):
+                            article_dict[k] = str(article_dict[k])
+                    article_dicts.append(article_dict)
+                
+                # Update and broadcast the articles
+                await self.update_articles(article_dicts)
+            
+            # Update status to show we've finished processing
+            await self.update_system_status("OK", location)
+            logger.info(f"Completed processing location: {location}")
+            
+        except Exception as e:
+            logger.error(f"Error processing location '{location}': {e}", exc_info=True)
+            await self.update_system_status("Error", location)
 
 
 metrics_collector = MetricsCollector()

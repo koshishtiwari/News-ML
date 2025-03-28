@@ -12,6 +12,35 @@
         .log-entry { margin-bottom: 3px; }
         .log-ERROR, .log-CRITICAL { color: red; font-weight: bold;}
         .log-WARNING { color: orange; }
+        /* Articles panel styling */
+        .articles-panel { 
+            height: 400px; 
+            overflow-y: scroll; 
+            border: 1px solid #ccc; 
+            padding: 15px;
+            margin-bottom: 15px; 
+        }
+        .article-card {
+            border-bottom: 1px solid #eee;
+            padding-bottom: 15px;
+            margin-bottom: 15px;
+        }
+        .article-title {
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        .article-meta {
+            font-size: 0.8em;
+            color: #666;
+            margin-bottom: 5px;
+        }
+        .article-summary {
+            font-size: 0.9em;
+        }
+        .importance-Critical { color: #ff4500; font-weight: bold; }
+        .importance-High { color: #ff8c00; font-weight: bold; }
+        .importance-Medium { color: #2e8b57; }
+        .importance-Low { color: #708090; }
         /* Add more styles */
         canvas { max-width: 100%; } /* Responsive charts */
     </style>
@@ -32,7 +61,14 @@
             <div class="level-item has-text-centered">
                 <div>
                     <p class="heading">Active Location</p>
-                    <p class="title" id="active-location">None</p>
+                    <div class="field has-addons">
+                        <div class="control">
+                            <input class="input" type="text" id="location-input" placeholder="Enter location...">
+                        </div>
+                        <div class="control">
+                            <button class="button is-primary" id="location-submit">Process</button>
+                        </div>
+                    </div>
                 </div>
             </div>
              <!-- Add more KPIs here -->
@@ -64,10 +100,20 @@
           </div>
      </section>
 
-    <!-- Section 4: Data Funnel -->
+    <!-- Section 4: Data Funnel and Articles -->
     <section class="section" id="funnel">
-        <h2 class="subtitle">Data Processing Funnel</h2>
-        <div id="funnel-display"><!-- Display counts/bars here --></div>
+        <div class="columns">
+            <div class="column is-half">
+                <h2 class="subtitle">Data Processing Funnel</h2>
+                <div id="funnel-display"><!-- Display counts/bars here --></div>
+            </div>
+            <div class="column is-half">
+                <h2 class="subtitle">Articles (Sorted by Importance & Recency)</h2>
+                <div class="articles-panel" id="articles-display">
+                    <div class="has-text-centered">No articles to display yet</div>
+                </div>
+            </div>
+        </div>
     </section>
 
     <!-- Section 5: Agent Status -->
@@ -78,7 +124,6 @@
             <tbody><!-- Data added by JS --></tbody>
         </table>
     </section>
-
 
     <!-- Section 6: Logs & Errors -->
     <section class="section" id="logs">
@@ -93,7 +138,6 @@
             </div>
         </div>
     </section>
-
 
     <!-- Include Chart.js (Download or use CDN) -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>

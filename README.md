@@ -81,29 +81,6 @@ python main.py --provider ollama --model gemma:2b --location "San Francisco"
 python main.py --monitor
 ```
 
-The monitor interface will be available at http://localhost:8000
-
-#### Using the Monitor Dashboard
-
-1. **Open your web browser** and navigate to http://localhost:8000
-2. The dashboard automatically connects via WebSocket and displays:
-   - System status and active location
-   - Real-time CPU and memory usage graphs
-   - Articles processed and error rates
-   - Log messages and errors
-   - Agent status table showing current tasks
-   - LLM performance metrics
-
-3. **Key dashboard panels:**
-   - **System Overview**: Shows overall system status and currently processing location
-   - **Real-time Metrics**: Graphs showing CPU/memory usage and processing rates
-   - **LLM Performance**: Table showing calls, errors, and latency for each LLM model
-   - **Agent Status**: Shows what each agent component is currently doing
-   - **Logs Panel**: Latest log messages from the system
-   - **Errors Panel**: Critical and error-level messages
-
-4. The dashboard auto-refreshes as new data comes in. No need to reload the page.
-
 ### With API Server
 
 ```bash
