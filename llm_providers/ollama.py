@@ -138,15 +138,15 @@ class OllamaLLM(LLMProvider):
                 logger.error(f"Unexpected error calling Ollama API: {e}", exc_info=True)
                 retries += 1  # Other errors are retriable, but might be futile
         
-        finally:
-            latency = time.monotonic() - start_time
-            metrics_collector.record_llm_call(
-                provider="ollama",
-                model=self.model,
-                latency=latency,
-                is_error=is_error
-            )
-            logger.debug(f"Ollama call complete: latency={latency:.3f}s, error={is_error}, retries={retries}")
+            finally:
+                latency = time.monotonic() - start_time
+                metrics_collector.record_llm_call(
+                    provider="ollama",
+                    model=self.model,
+                    latency=latency,
+                    is_error=is_error
+                )
+                logger.debug(f"Ollama call complete: latency={latency:.3f}s, error={is_error}, retries={retries}")
 
         # If we've exhausted retries and still have an error
         if is_error and last_error:

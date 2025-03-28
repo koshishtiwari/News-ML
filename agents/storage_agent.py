@@ -31,7 +31,7 @@ class NewsStorageAgent:
 
     async def _get_db(self) -> aiosqlite.Connection:
         """Gets a connection to the SQLite database asynchronously."""
-        if self._db is None or self._db.closed:
+        if self._db is None or self._db.close:
             try:
                 # Using aiosqlite for async database operations
                 self._db = await aiosqlite.connect(
@@ -85,7 +85,7 @@ class NewsStorageAgent:
 
     async def close(self):
         """Close the database connection when done."""
-        if self._db is not None and not self._db.closed:
+        if self._db is not None and not self._db.close:
             await self._db.close()
             self._db = None
             logger.debug("Database connection closed.")
