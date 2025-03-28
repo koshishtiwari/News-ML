@@ -20,7 +20,8 @@ from llm_providers.factory import create_llm_provider
 from monitor.metrics import metrics_collector, MetricsLogHandler
 from monitor.backend.server import app as monitor_app 
 
-# Import the FastAPI app
+# Import the new API app
+from api import api_app
 
 # --- Add Custom Log Handler ---
 # Check if handler already exists to avoid duplicates during potential reloads
@@ -33,21 +34,29 @@ else:
     logger.debug("MetricsLogHandler already present.")
 
 
+def start_server(app, host, port, name="Server"):
+    """Runs a FastAPI app using Uvicorn in a separate thread."""
+    logger.info(f"Starting {name} on {host}:{port} in thread: {threading.current_thread().name}")
+    try:
+        uvicorn_config = uvicorn.Config(app, host=host, port=port, log_level="warning", loop="asyncio")
+        server = uvicorn.Server(uvicorn_config)
+        server.run()
+        logger.info(f"{name} thread finished.")
+    except Exception as e:
+        logger.critical(f"Failed to run {name}: {e}", exc_info=True)
+
+
 def start_monitor_server(host="0.0.0.0", port=8000):
     """Runs the FastAPI monitor server using Uvicorn in a separate thread."""
-    logger.info(f"Starting monitor server on {host}:{port} in thread: {threading.current_thread().name}")
-    try:
-        # Configure uvicorn to run the FastAPI app
-        # Use loop='asyncio' to ensure it uses the correct event loop policy if needed
-        uvicorn_config = uvicorn.Config(monitor_app, host=host, port=port, log_level="warning", loop="asyncio")
-        server = uvicorn.Server(uvicorn_config)
-        # This runs the server synchronously within this thread
-        server.run()
-        logger.info("Monitor server thread finished.") # Should ideally not be reached unless stopped
-    except Exception as e:
-        logger.critical(f"Failed to run monitor server: {e}", exc_info=True)
+    start_server(monitor_app, host, port, name="Monitor Server")
 
-async def run_news_system(run_monitor: bool, monitor_host: str, monitor_port: int):
+
+def start_api_server(host="0.0.0.0", port=8001):
+    """Runs the API server using Uvicorn in a separate thread."""
+    start_server(api_app, host, port, name="API Server")
+
+
+async def run_news_system(run_monitor: bool, monitor_host: str, monitor_port: int, run_api: bool, api_host: str, api_port: int):
     """Handles user interaction and runs the news aggregation loop."""
     logger.info("==========================================")
     logger.info(" Location-Based Agentic News System (V3)")
@@ -62,7 +71,7 @@ async def run_news_system(run_monitor: bool, monitor_host: str, monitor_port: in
         sys.exit(1)
 
     # --- Start Monitor Server (if requested) ---
-    monitor_thread = None
+    server_threads = []
     if run_monitor:
         logger.info("Starting monitor server thread...")
         monitor_thread = threading.Thread(
@@ -71,25 +80,57 @@ async def run_news_system(run_monitor: bool, monitor_host: str, monitor_port: in
             daemon=True
         )
         monitor_thread.start()
+        server_threads.append(monitor_thread)
         # Brief pause to allow server thread to initialize
-        await asyncio.sleep(3)
-        logger.info(f"Monitor server should be running at http://{monitor_host}:{monitor_port}")
+        await asyncio.sleep(1)
+        logger.info(f"Monitor web UI should be running at http://{monitor_host}:{monitor_port}")
 
+    # --- Start API Server (if requested) ---
+    if run_api:
+        logger.info("Starting API server thread...")
+        api_thread = threading.Thread(
+            target=start_api_server,
+            args=(api_host, api_port),
+            daemon=True
+        )
+        api_thread.start()
+        server_threads.append(api_thread)
+        # Brief pause to allow server thread to initialize
+        await asyncio.sleep(1)
+        logger.info(f"API server should be running at http://{api_host}:{api_port}/docs")
 
-    # --- Argument Parsing & LLM Setup (moved inside async func) ---
-    parser = argparse.ArgumentParser(description="Run the Location-Based Agentic News System.", add_help=False) # add_help=False if redefined below
-    # ... Add arguments as before ...
-    # Parse args *within* the async function if needed, or pass from main scope
-    # Re-parsing here for clarity if needed, but could be passed as args to run_news_system
+    # Wait a bit longer if any servers are starting
+    if server_threads:
+        await asyncio.sleep(2)
+
+    # --- Argument Parsing & LLM Setup ---
     parser = argparse.ArgumentParser(description="Run the Location-Based Agentic News System.")
-    parser.add_argument("--monitor", action="store_true", help="Run the real-time web monitor.") # Already used to start thread
+    parser.add_argument("--monitor", action="store_true", help="Run the real-time web monitor.")
     parser.add_argument("--monitor-host", type=str, default="0.0.0.0", help="Host for the monitor server.")
     parser.add_argument("--monitor-port", type=int, default=8000, help="Port for the monitor server.")
+    parser.add_argument("--api", action="store_true", help="Run the API server.")
+    parser.add_argument("--api-host", type=str, default="0.0.0.0", help="Host for the API server.")
+    parser.add_argument("--api-port", type=int, default=8001, help="Port for the API server.")
     parser.add_argument("--provider", type=str, default="ollama", choices=["ollama", "gemini", "openai", "anthropic"], help="LLM provider.")
     parser.add_argument("--model", type=str, help="LLM model name.")
     parser.add_argument("--location", type=str, help="Run for a specific location and exit.")
+    parser.add_argument("--server-only", action="store_true", help="Run only the servers without interactive mode.")
     args = parser.parse_args() # Parse again if needed inside
 
+    # If server-only mode is requested, just keep the servers running
+    if args.server_only:
+        if not (run_monitor or run_api):
+            logger.warning("Server-only mode requested but no servers enabled. Use --monitor or --api flags.")
+            return
+            
+        logger.info("Running in server-only mode. Press Ctrl+C to exit.")
+        try:
+            # Keep the main thread alive indefinitely
+            while True:
+                await asyncio.sleep(3600)  # Sleep for an hour at a time
+        except KeyboardInterrupt:
+            logger.info("Received interrupt signal, shutting down servers.")
+            return
 
     llm_provider = None
     while llm_provider is None:
@@ -99,7 +140,7 @@ async def run_news_system(run_monitor: bool, monitor_host: str, monitor_port: in
         is_interactive = not args.location and sys.stdin.isatty()
 
         if is_interactive and not args.provider: # Allow override if interactive
-             provider_type = input(f"Enter LLM provider (ollama, ...) [default: {args.provider}]: ").strip().lower() or args.provider
+             provider_type = input(f"Enter LLM provider (ollama, gemini, ...) [default: {args.provider}]: ").strip().lower() or args.provider
 
         try:
             if provider_type == "ollama" and not model_name:
@@ -168,7 +209,7 @@ async def run_news_system(run_monitor: bool, monitor_host: str, monitor_port: in
          logger.info("Stopping monitor background tasks...")
          await metrics_collector.stop_background_tasks()
 
-    # Monitor thread is daemon, will exit when main process ends.
+    # All server threads are daemon threads and will exit when main process ends
 
 if __name__ == "__main__":
     if sys.platform == "win32":
@@ -180,14 +221,21 @@ if __name__ == "__main__":
     temp_parser.add_argument("--monitor", action="store_true")
     temp_parser.add_argument("--monitor-host", type=str, default="0.0.0.0")
     temp_parser.add_argument("--monitor-port", type=int, default=8000)
+    temp_parser.add_argument("--api", action="store_true")
+    temp_parser.add_argument("--api-host", type=str, default="0.0.0.0")
+    temp_parser.add_argument("--api-port", type=int, default=8001)
+    temp_parser.add_argument("--server-only", action="store_true")
     known_args, _ = temp_parser.parse_known_args()
 
     try:
-        # Pass monitor args to the main async function
+        # Pass args to the main async function
         asyncio.run(run_news_system(
             run_monitor=known_args.monitor,
             monitor_host=known_args.monitor_host,
-            monitor_port=known_args.monitor_port
+            monitor_port=known_args.monitor_port,
+            run_api=known_args.api,
+            api_host=known_args.api_host,
+            api_port=known_args.api_port
         ))
     except KeyboardInterrupt:
         logger.info("Process terminated by user.")

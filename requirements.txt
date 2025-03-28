@@ -2,12 +2,22 @@
 aiohttp>=3.9.0
 beautifulsoup4>=4.12.0
 lxml[html_clean]>=5.0.0  # Ensure the cleaner is installed
+lxml_html_clean>=0.4.1
 newspaper3k>=0.2.8      # Or specify the exact version you have
 pytz>=2023.3
 tqdm>=4.65.0
 requests>=2.31.0        # newspaper3k might still need it indirectly
 python-dotenv>=1.0.0    # For loading .env file
-psutil>=5.9.0 # Added for resource monitoring
-fastapi>=0.100.0         # Added for monitor backend
+psutil>=5.9.0           # Added for resource monitoring
+fastapi>=0.100.0        # Added for monitor backend
 uvicorn[standard]>=0.22.0 # Added for running FastAPI
-websockets>=11.0  
+websockets>=11.0
+google-generativeai>=0.3.0 # Added for Gemini API support
+aiosqlite>=0.19.0       # Added for async SQLite support
+pydantic>=2.0.0         # Added for data validation
+colorama>=0.4.6         # Added for colorized terminal output
+
+# Vector embedding and similarity search
+sentence-transformers>=2.2.2  # For generating embeddings
+faiss-cpu>=1.7.4        # For efficient similarity search (use faiss-gpu for GPU support)
+numpy>=1.24.0           # Required for vector operations

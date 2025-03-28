@@ -1,7 +1,9 @@
-## TODO / Future Enhancements
+# TODO / Future Enhancements
 
-*   Implement RSS feed discovery and processing.
-*   Improve link discovery beyond basic homepage parsing.
-*   Add a simple API/Web UI (FastAPI) to query the database.
-*   Use proper async database drivers.
-*   Implement vector embeddings, indexing and similarity search.
+1. Performance optimizations for the crawling process - parallel processing could be enhanced further
+2. Caching improvements to reduce redundant requests and processing
+3. LLM cost optimization by implementing more selective analysis
+4. UI enhancements for both monitoring and presentation interfaces
+5. API expansion for more flexible integration options
+6. Error handling refinements to make the system more resilient
+7. Source quality assessment to prioritize reliable news sources

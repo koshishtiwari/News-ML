@@ -1,10 +1,8 @@
-# This is a placeholder file
 import logging
 
 from .base import LLMProvider
 from .ollama import OllamaLLM
-# Import other providers like GeminiLLM when implemented
-# from .gemini import GeminiLLM
+from .gemini import GeminiLLM  # Import the implemented GeminiLLM
 
 # Import config (make sure this doesn't create circular dependencies)
 from config import (
@@ -42,10 +40,9 @@ def create_llm_provider(provider_type: str, model: str = None) -> LLMProvider:
     elif provider_type == "gemini":
          if not GEMINI_API_KEY:
              raise ValueError("GEMINI_API_KEY not found in environment variables.")
-         # Implement GeminiLLM and return instance
-         # model = model or "gemini-1.5-flash-latest" # Example default
-         # return GeminiLLM(api_key=GEMINI_API_KEY, model=model)
-         raise NotImplementedError("Gemini provider not yet fully implemented in factory.")
+         # Use provided model or default to gemini-1.5-flash
+         model = model or "gemini-1.5-flash"
+         return GeminiLLM(api_key=GEMINI_API_KEY, model=model)
     elif provider_type == "openai":
          if not OPENAI_API_KEY:
               raise ValueError("OPENAI_API_KEY not found in environment variables.")
