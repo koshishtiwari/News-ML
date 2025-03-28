@@ -78,9 +78,14 @@ async def get_index():
 @app.on_event("startup")
 async def startup_event():
     logger.info("Monitor backend starting up...")
-    # Start background tasks from the metrics collector
-    await metrics_collector.start_background_tasks()
-    logger.info("Monitor background tasks started.")
+    try:
+        # Set the event loop for the metrics collector
+        metrics_collector.set_loop(asyncio.get_running_loop())
+        # Start background tasks from the metrics collector
+        await metrics_collector.start_background_tasks()
+        logger.info("Monitor background tasks started.")
+    except Exception as e:
+        logger.error(f"Failed to set up metrics_collector or start background tasks: {e}", exc_info=True)
 
 @app.on_event("shutdown")
 async def shutdown_event():
