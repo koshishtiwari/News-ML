@@ -1,0 +1,13 @@
+# Add project dependencies here
+aiohttp>=3.9.0
+beautifulsoup4>=4.12.0
+lxml[html_clean]>=5.0.0  # Ensure the cleaner is installed
+newspaper3k>=0.2.8      # Or specify the exact version you have
+pytz>=2023.3
+tqdm>=4.65.0
+requests>=2.31.0        # newspaper3k might still need it indirectly
+python-dotenv>=1.0.0    # For loading .env file
+psutil>=5.9.0 # Added for resource monitoring
+fastapi>=0.100.0         # Added for monitor backend
+uvicorn[standard]>=0.22.0 # Added for running FastAPI
+websockets>=11.0  
