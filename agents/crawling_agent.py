@@ -27,6 +27,9 @@ from tqdm.asyncio import tqdm as async_tqdm
 from models.data_models import NewsSource, NewsArticle
 from utils.logging_config import get_logger
 
+# Import metrics collector for real-time updates
+from monitor.metrics import metrics_collector
+
 # Use our enhanced logger
 logger = get_logger(__name__, {"component": "crawler"})
 
@@ -382,6 +385,13 @@ class NewsCrawlingAgent:
         task_logger = logger.with_context(task=f"process_article:{url[-20:]}")
         task_logger.debug(f"Processing article: {url}")
         
+        # Update agent status to show currently processing article
+        await metrics_collector.update_agent_status(
+            "crawling",
+            "Crawling",
+            {"url": url, "source": source_name}
+        )
+        
         # Fetch the HTML content
         html = await self._fetch_with_throttling(url)
         
@@ -413,7 +423,7 @@ class NewsCrawlingAgent:
                 publish_dt = pub_date.astimezone(timezone.utc)
         
         # Create and return a NewsArticle object
-        return NewsArticle(
+        article = NewsArticle(
             url=url,
             title=article_obj.title,
             source_name=source_name,
@@ -422,6 +432,12 @@ class NewsCrawlingAgent:
             location_query=location_query,
             fetched_at=datetime.now(timezone.utc)
         )
+        
+        # Send real-time update to the frontend
+        # Note: The article will appear with "Processing..." status since it hasn't been analyzed yet
+        await metrics_collector.update_article(article)
+        
+        return article
 
     async def discover_links_from_source(self, source: NewsSource, limit: int = 25) -> List[str]:
         """
@@ -528,6 +544,13 @@ class NewsCrawlingAgent:
         task_logger = logger.with_context(task="crawl_source", source=source.name)
         task_logger.info(f"Crawling source: {source.name}")
         
+        # Update agent status to show currently processing source
+        await metrics_collector.update_agent_status(
+            "crawling", 
+            "Crawling Source", 
+            {"source": source.name}
+        )
+        
         start_time = time.time()
         
         # Discover links first
@@ -568,6 +591,9 @@ class NewsCrawlingAgent:
                 success_rate = len(processed_articles) / completed_tasks if completed_tasks > 0 else 0
                 task_logger.debug(f"Progress: {completed_tasks}/{total_tasks} articles, "
                                  f"{len(processed_articles)} successful ({success_rate:.0%})")
+                
+                # Update the funnel counts in real-time
+                metrics_collector.increment_funnel_count("articles_fetched", len(processed_articles))
         
         elapsed = time.time() - start_time
         success_rate = len(processed_articles) / len(tasks) if tasks else 0
@@ -591,6 +617,13 @@ class NewsCrawlingAgent:
         """
         task_logger = logger.with_context(task="crawl_sources", location=location_query)
         task_logger.info(f"Starting crawl for {len(sources)} sources for location '{location_query}'")
+        
+        # Update agent status
+        await metrics_collector.update_agent_status(
+            "crawling",
+            "Starting Crawl",
+            {"location": location_query, "sources": len(sources)}
+        )
         
         start_time = time.time()
         all_articles: List[NewsArticle] = []
@@ -623,6 +656,9 @@ class NewsCrawlingAgent:
                                f"Found {len(source_articles)} articles, "
                                f"Total so far: {len(all_articles)}")
                 
+                # Update funnel counts
+                metrics_collector.increment_funnel_count("articles_validated", len(source_articles))
+                
                 # Brief delay between sources for politeness
                 await asyncio.sleep(0.5)
             
@@ -638,10 +674,23 @@ class NewsCrawlingAgent:
                            f"Found {len(final_articles)} unique articles "
                            f"(removed {dedup_count} duplicates) in {elapsed:.1f}s")
             
+            # Update agent status to show completion
+            await metrics_collector.update_agent_status(
+                "crawling",
+                "Idle",
+                {"completed": f"{len(final_articles)} articles"}
+            )
+            
             return final_articles
             
         except Exception as e:
             task_logger.error(f"Unexpected error during crawl_sources: {e}", exc_info=True)
+            # Update agent status to show error
+            await metrics_collector.update_agent_status(
+                "crawling",
+                "Error",
+                {"error": str(e)}
+            )
             return all_articles
         finally:
             # Ensure we always close the session

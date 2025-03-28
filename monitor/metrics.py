@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 MAX_METRIC_POINTS = 360 # e.g., 60 minutes at 1 point per 10 seconds
 MAX_LOG_ENTRIES = 250 # Increased slightly
 MAX_ERROR_ENTRIES = 100
+MAX_ARTICLE_DISPLAY = 100 # Maximum articles to keep in memory
 
 @dataclass
 class TimeSeriesData:
@@ -447,6 +448,44 @@ class MetricsCollector:
                  logger.error(f"Problematic data state (partial): {str(self.__dict__)[:2000]}")
                  return {"system_status": {"status": "Error - Data Serialization Failed"}}
 
+    async def update_article(self, article):
+        """Update a single article and broadcast it to clients in real-time."""
+        try:
+            # Convert article object to dictionary for JSON serialization
+            if hasattr(article, '__dict__'):
+                article_dict = article.__dict__.copy()
+                # Clean up any non-serializable attributes
+                for k in list(article_dict.keys()):
+                    if k.startswith('_') or not isinstance(article_dict[k], (str, int, float, bool, list, dict, type(None))):
+                        article_dict[k] = str(article_dict[k])
+            else:
+                article_dict = dict(article)
+            
+            # Add the article to our current list
+            with self._lock:
+                # Check if article with same URL already exists
+                exists = False
+                for i, existing_article in enumerate(self.current_articles):
+                    if existing_article.get('url') == article_dict.get('url'):
+                        # Update existing article
+                        self.current_articles[i] = article_dict
+                        exists = True
+                        break
+                
+                # Add if not already in the list
+                if not exists:
+                    self.current_articles.append(article_dict)
+                    # Keep the list at a reasonable size
+                    if len(self.current_articles) > MAX_ARTICLE_DISPLAY:
+                        self.current_articles = self.current_articles[-MAX_ARTICLE_DISPLAY:]
+            
+            # Broadcast the individual article update
+            await self.broadcast("article_update", {"article": article_dict})
+            logger.debug(f"Broadcast article update: {article_dict.get('title', 'Untitled')[:30]}...")
+            
+        except Exception as e:
+            logger.error(f"Error updating article: {e}", exc_info=True)
+    
     async def update_articles(self, articles):
         """Update the current articles and broadcast them to all connected clients."""
         with self._lock:
@@ -469,17 +508,19 @@ class MetricsCollector:
             # Reset funnel counts
             with self._lock:
                 self.funnel_counts = defaultdict(int)
+                # Clear current articles
+                self.current_articles = []
             await self.broadcast("funnel_update", self.funnel_counts)
             
-            # Clear current articles
-            await self.update_articles([])
+            # Clear current articles in the UI
+            await self.broadcast("articles_update", {"articles": []})
             
             # Process the location with the news system
             # This will update metrics and funnel counts automatically
             result = await self.news_system.process_location(location)
             
-            # The news system should have updated all metrics during processing
-            # We can get the final articles from the storage agent
+            # The news system already updates articles in real-time now
+            # But we still fetch all articles at the end to ensure completeness
             if hasattr(self.news_system, 'storage_agent'):
                 articles = await self.news_system.storage_agent.get_articles_by_location(location, limit=100)
                 article_dicts = []
@@ -492,8 +533,10 @@ class MetricsCollector:
                             article_dict[k] = str(article_dict[k])
                     article_dicts.append(article_dict)
                 
-                # Update and broadcast the articles
-                await self.update_articles(article_dicts)
+                # Update and broadcast the complete articles list
+                with self._lock:
+                    self.current_articles = article_dicts
+                await self.broadcast("articles_update", {"articles": article_dicts})
             
             # Update status to show we've finished processing
             await self.update_system_status("OK", location)

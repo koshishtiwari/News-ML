@@ -9,6 +9,8 @@ from typing import List
 from models.data_models import NewsArticle
 # Assuming LLM provider base/interface is in ../llm_providers/
 from llm_providers.base import LLMProvider
+# Import metrics collector for real-time updates
+from monitor.metrics import metrics_collector
 
 from tqdm.asyncio import tqdm as async_tqdm
 
@@ -24,6 +26,13 @@ class NewsAnalysisAgent:
     async def analyze_article(self, article: NewsArticle) -> NewsArticle:
         """Analyze content to add summary, importance, and category using LLM."""
         logger.debug(f"Analyzing article content: '{article.title[:60]}...' ({article.url})")
+        
+        # Update agent status to show current article being processed
+        await metrics_collector.update_agent_status(
+            "analysis",
+            "Analyzing",
+            {"title": article.title[:40], "url": article.url}
+        )
 
         # Content validation happened during crawling, assume article.content is good here
         if not article.content:
@@ -31,6 +40,8 @@ class NewsAnalysisAgent:
             article.summary = "Content unavailable."
             article.importance = "Medium"
             article.category = "Unknown"
+            # Send real-time update even for skipped articles
+            await metrics_collector.update_article(article)
             return article
 
         # Prepare snippet for LLM
@@ -66,6 +77,8 @@ class NewsAnalysisAgent:
              article.summary = "Summary generation failed (LLM error)."
              article.importance = "Medium"
              article.category = "Unknown"
+             # Send real-time update even for failed articles
+             await metrics_collector.update_article(article)
              return article
 
         try:
@@ -88,6 +101,10 @@ class NewsAnalysisAgent:
             article.category = str(cat) if (cat := analysis.get('category')) and cat in valid_categories else "Other"
 
             logger.debug(f"  -> Analysis complete for {article.url}: Importance={article.importance}, Category={article.category}")
+            
+            # Send real-time update for the analyzed article
+            await metrics_collector.update_article(article)
+            
             return article
 
         except json.JSONDecodeError as e:
@@ -96,6 +113,8 @@ class NewsAnalysisAgent:
             article.summary = "Summary generation failed (JSON error)."
             article.importance = "Medium"
             article.category = "Unknown"
+            # Send real-time update even for failed articles
+            await metrics_collector.update_article(article)
             return article
         except Exception as e:
             logger.error(f"Unexpected error during LLM analysis for {article.url}: {e}", exc_info=True)
@@ -103,6 +122,8 @@ class NewsAnalysisAgent:
             article.summary = "Summary generation failed (unexpected error)."
             article.importance = "Medium"
             article.category = "Unknown"
+            # Send real-time update even for failed articles
+            await metrics_collector.update_article(article)
             return article
 
     async def analyze_articles(self, articles: List[NewsArticle]) -> List[NewsArticle]:
@@ -119,5 +140,8 @@ class NewsAnalysisAgent:
              # We always append the article, even if analysis failed, as defaults are set
              analyzed_results.append(result)
 
+        # Reset agent status when all done
+        await metrics_collector.update_agent_status("analysis", "Idle")
+        
         logger.info(f"Finished LLM analysis for {len(analyzed_results)} articles.")
         return analyzed_results

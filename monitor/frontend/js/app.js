@@ -271,6 +271,12 @@ function handleWebSocketMessage(message) {
             updateLlmMetricEntry(payload);
             break;
 
+        case 'article_update':
+            if (payload.article) {
+                updateSingleArticle(payload.article);
+            }
+            break;
+
         case 'articles_update':
             if (payload.articles) {
                 updateArticles(payload.articles);
@@ -290,6 +296,33 @@ function handleWebSocketMessage(message) {
         default:
             console.warn("Received unknown WS message type:", type);
     }
+}
+
+// Function to handle a single article update
+function updateSingleArticle(article) {
+    if (!articlesDisplay || !article) return;
+
+    console.log("Received single article update:", article.title);
+
+    // Check if article with same URL already exists
+    let existingIndex = -1;
+    for (let i = 0; i < currentArticles.length; i++) {
+        if (currentArticles[i].url === article.url) {
+            existingIndex = i;
+            break;
+        }
+    }
+
+    if (existingIndex !== -1) {
+        // Update existing article
+        currentArticles[existingIndex] = article;
+    } else {
+        // Add new article to the list
+        currentArticles.push(article);
+    }
+
+    // Re-sort and update the display
+    updateArticles(currentArticles);
 }
 
 // --- UI Update Functions ---
@@ -483,21 +516,67 @@ function updateArticles(articles) {
         articlesDisplay.appendChild(card);
     });
 
+    // Optionally animate new articles
+    const allCards = articlesDisplay.querySelectorAll('.article-card');
+    if (allCards.length > 0) {
+        const newestCard = allCards[0]; // First card is newest due to sort
+        newestCard.classList.add('new-article');
+        setTimeout(() => {
+            newestCard.classList.remove('new-article');
+        }, 1500);
+    }
+
     // Auto-scroll to top
     articlesDisplay.scrollTop = 0;
 }
 
+// Add a CSS class for new article animation
+function addArticleAnimationStyles() {
+    const styleEl = document.createElement('style');
+    styleEl.textContent = `
+        @keyframes highlightNew {
+            0% { background-color: rgba(121, 187, 255, 0.3); }
+            100% { background-color: transparent; }
+        }
+        .article-card.new-article {
+            animation: highlightNew 1.5s ease-out;
+        }
+        .article-status-processing {
+            color: orange;
+            font-style: italic;
+        }
+        .article-status-complete {
+            color: green;
+        }
+    `;
+    document.head.appendChild(styleEl);
+}
+
+// Enhanced article card creation with status indicators
 function createArticleCard(article) {
     const card = document.createElement('div');
     card.className = 'article-card';
+    card.setAttribute('data-url', article.url);
 
     // Format dates
     const publishedDate = article.published_at ? formatDate(article.published_at) : 'Unknown';
     const fetchedDate = article.fetched_at ? formatDate(article.fetched_at) : 'Unknown';
 
+    // Determine if article has a complete analysis
+    const hasFullAnalysis = article.summary && article.summary !== 'Content unavailable.' && 
+                           !article.summary.includes('Summary generation failed');
+
+    // Status indicator
+    let statusHtml = '';
+    if (!hasFullAnalysis) {
+        statusHtml = '<span class="article-status-processing">Processing...</span>';
+    } else {
+        statusHtml = '<span class="article-status-complete">✓</span>';
+    }
+
     // Create HTML content
     card.innerHTML = `
-        <h3 class="article-title">${article.title || 'Untitled Article'}</h3>
+        <h3 class="article-title">${article.title || 'Untitled Article'} ${statusHtml}</h3>
         <div class="article-meta">
             <span>Source: ${article.source_name || 'Unknown'} | Importance: <span class="importance-${article.importance}">${article.importance || 'Unknown'}</span> | Category: ${article.category || 'Uncategorized'}</span>
         </div>
@@ -505,7 +584,7 @@ function createArticleCard(article) {
             <span>Published: ${publishedDate} | Fetched: ${fetchedDate} UTC</span>
         </div>
         <div class="article-summary">
-            <strong>Summary:</strong> ${article.summary || 'No summary available'}
+            <strong>Summary:</strong> ${article.summary || 'Processing article content...'}
         </div>
         <div class="article-meta mt-2">
             <a href="${article.url}" target="_blank">View Source</a>
@@ -568,6 +647,9 @@ async function processLocation(location) {
 
 // --- Initialization ---
 document.addEventListener('DOMContentLoaded', () => {
+    // Add animation styles
+    addArticleAnimationStyles();
+
     connectWebSocket();
 
     // Set up location submission handlers
