@@ -166,6 +166,9 @@ async def run_news_system(run_monitor: bool, monitor_host: str, monitor_port: in
     # --- System Initialization ---
     try:
         system = NewsAggregationSystem(llm_provider)
+        # Set the system reference in metrics_collector
+        metrics_collector.set_news_system(system)
+        logger.info("News system reference set in metrics collector")
     except Exception as e:
         logger.critical(f"Failed to initialize NewsAggregationSystem: {e}", exc_info=True)
         sys.exit(1)
