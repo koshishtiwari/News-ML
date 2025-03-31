@@ -1,17 +1,20 @@
-from monitor.metrics import metrics_collector # Import global instance
+from monitor.metrics import metrics_collector
 import logging
 import time
 import asyncio
-import psutil # Import psutil
+import psutil
 from collections import defaultdict
 import statistics
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
+import uuid
 
-from agents.discovery_agent import NewsSourceDiscoveryAgent
-from agents.crawling_agent import NewsCrawlingAgent
-from agents.analysis_agent import NewsAnalysisAgent
-from agents.organization_agent import NewsOrganizationAgent
-from agents.storage_agent import NewsStorageAgent
+from agents.task_manager import TaskManager, TaskPriority
+from agents.base_agent import BaseAgent
+from agents.micro_agents.source_discovery_agent import SourceDiscoveryAgent
+from agents.micro_agents.rss_discovery_agent import RSSDiscoveryAgent
+from agents.micro_agents.content_extraction_agent import ContentExtractionAgent
+from agents.micro_agents.content_analysis_agent import ContentAnalysisAgent
+from models.data_models import NewsSource, NewsArticle
 from llm_providers.base import LLMProvider
 import config
 
@@ -81,7 +84,6 @@ class ProcessingMetrics:
         except Exception:
              summary.append("  - Failed to calculate resource peaks.")
 
-
         if self.errors:
             summary.append(f"\nErrors ({len(self.errors)}):")
             # Optionally list first few errors
@@ -91,32 +93,76 @@ class ProcessingMetrics:
         return "\n".join(summary)
 
 
-class NewsAggregationSystem:
-    """Orchestrates the news aggregation process with monitoring."""
+class NewsOrchestrator:
+    """Orchestrates the news aggregation process with micro-agents and monitoring."""
 
     def __init__(self, llm_provider: LLMProvider):
         self.llm_provider = llm_provider
-        # Initialize agents (pass shared session if optimizing later)
-        self.discovery_agent = NewsSourceDiscoveryAgent(llm_provider)
-        self.crawling_agent = NewsCrawlingAgent()
-        self.analysis_agent = NewsAnalysisAgent(llm_provider)
-        self.organization_agent = NewsOrganizationAgent(llm_provider)
-        self.storage_agent = NewsStorageAgent(db_path=config.DATABASE_PATH)
-        logger.info("NewsAggregationSystem initialized with all agents.")
-        # Simple health check on init
-        asyncio.create_task(self._initial_health_check())
+        
+        # Create task manager
+        self.task_manager = TaskManager(max_concurrent_tasks=15)
+        
+        # Initialize agent instances
+        self.source_discovery_agent = SourceDiscoveryAgent(llm_provider)
+        self.rss_discovery_agent = RSSDiscoveryAgent()
+        self.content_extraction_agent = ContentExtractionAgent()
+        self.content_analysis_agent = ContentAnalysisAgent(llm_provider)
+        
+        # Additional agent instances can be created for scalability
+        # For example, multiple content extraction agents for parallelization:
+        self.extraction_agents = [self.content_extraction_agent]
+        for i in range(2):  # Create 2 more extraction agents
+            self.extraction_agents.append(ContentExtractionAgent())
+            
+        # Register all agents with the task manager
+        self._register_agents()
+        
+        # Database agent will be handled separately for now
+        # self.db_agent = NewsStorageAgent(db_path=config.DATABASE_PATH)
+        
+        logger.info("NewsOrchestrator initialized with all micro-agents")
+        
+    def _register_agents(self):
+        """Register all agents with the task manager"""
+        # Register the main agents
+        self.task_manager.register_agent(self.source_discovery_agent)
+        self.task_manager.register_agent(self.rss_discovery_agent)
+        self.task_manager.register_agent(self.content_analysis_agent)
+        
+        # Register all extraction agents
+        for agent in self.extraction_agents:
+            self.task_manager.register_agent(agent)
+            
+    async def initialize(self):
+        """Initialize the orchestrator and all agents"""
+        await metrics_collector.update_system_status("Initializing")
+        
+        # Initialize the task manager (which initializes all agents)
+        await self.task_manager.initialize()
+        
+        # Start the task manager
+        await self.task_manager.start()
+        
+        # Perform initial system health check
+        await self._initial_health_check()
+        
+        await metrics_collector.update_system_status("Ready")
+        logger.info("NewsOrchestrator initialization complete")
+        
+    async def shutdown(self):
+        """Shutdown the orchestrator and all agents"""
+        await metrics_collector.update_system_status("Shutting down")
+        
+        # Shutdown the task manager (which shuts down all agents)
+        await self.task_manager.shutdown()
+        
+        await metrics_collector.update_system_status("Offline")
+        logger.info("NewsOrchestrator shutdown complete")
 
     async def _initial_health_check(self):
         """Performs a basic check of DB and LLM connectivity."""
         logger.info("Performing initial health checks...")
-        # DB Check
-        try:
-            # Perform a simple query
-            await self.storage_agent.get_articles_by_location("__health_check__", limit=1)
-            logger.info("DB connection check: OK")
-        except Exception as e:
-            logger.error(f"DB connection check failed: {e}", exc_info=True)
-
+        
         # LLM Check (Simple Ping/Short Generate)
         try:
             # Use a very short, harmless prompt
@@ -129,159 +175,217 @@ class NewsAggregationSystem:
             logger.error(f"LLM connectivity check failed: {e}", exc_info=True)
 
     async def process_location(self, location: str) -> str:
-        """Processes news aggregation for a location with metrics."""
-        # Use the global metrics_collector
-        global metrics_collector
+        """Process news for a location using the micro-agent workflow"""
+        metrics = ProcessingMetrics(location)
         logger.info(f"===== Processing Location: {location} =====")
         await metrics_collector.update_system_status("Processing", location=location)
-
-        metrics_collector.snapshot_resources() # Initial resource usage
-        process_start_time = time.monotonic()
-
-        final_presentation = f"Processing failed for {location}."
-        articles_to_present = []
-        note = ""
-        stage_start = time.monotonic() # Start timer for discovery
-
+        
+        metrics.snapshot_resources()  # Initial resource usage
+        
         try:
-            # 1. Discover Sources
-            sources = await self.discovery_agent.discover_sources(location)
-            metrics_collector.record_stage_timing("discover_sources", time.monotonic() - stage_start)
-            metrics_collector.increment_funnel_count("sources_discovered", len(sources)) # Verified count now
-            metrics_collector.snapshot_resources()
-
+            # Step 1: Discover sources for the location
+            source_discovery_start = time.monotonic()
+            await metrics_collector.update_system_status("Discovering sources", location=location)
+            
+            # Create source discovery task
+            source_discovery_task_id = await self.task_manager.create_task(
+                "discover_sources",
+                {"location": location, "limit": 10},
+                TaskPriority.HIGH
+            )
+            
+            # Wait for source discovery to complete
+            sources = await self.task_manager.get_task_result(source_discovery_task_id)
+            metrics.record_stage("discover_sources", source_discovery_start)
+            metrics.increment_count("sources_discovered", len(sources))
+            metrics.snapshot_resources()
+            
             if not sources:
-                msg = f"No verifiable sources discovered for '{location}'."
-                logger.warning(msg)
-                logger.warning(f"No verifiable sources discovered for '{location}'")
-                final_presentation = f"No verifiable news sources found for {location}."
-                await metrics_collector.update_system_status("Idle")
-                # Finalize and log summary on early exit
-                total_duration = time.monotonic() - process_start_time
-                metrics_collector.record_processing_time(total_duration)
-                logger.warning(f"Summary for '{location}' (failed early):\n{metrics_collector.get_initial_data()}") # Log snapshot
-                return final_presentation + f"\n\n(Processing time: {total_duration:.2f} seconds)"
-
-
-            # 2. Crawl Sources
-            stage_start = time.monotonic()
-            new_articles = await self.crawling_agent.crawl_sources(sources, location_query=location)
-            metrics_collector.record_stage_timing("crawl_sources", time.monotonic() - stage_start)
-            # Assuming crawl_sources returns validated articles
-            metrics_collector.increment_funnel_count("articles_validated", len(new_articles))
-            metrics_collector.snapshot_resources()
-
-            if not new_articles:
-                 logger.warning(f"No new articles fetched for '{location}'. Checking database...")
-                 logger.warning(f"No new articles fetched for '{location}'")
-                 # ... (DB check logic - record timing for it) ...
-                 stage_start_db = time.monotonic()
-                 existing_articles = await self.storage_agent.get_articles_by_location(location, limit=25)
-                 metrics_collector.record_stage_timing("db_check_existing", time.monotonic() - stage_start_db)
-                 if existing_articles:
-                      metrics_collector.increment_funnel_count("articles_from_db", len(existing_articles))
-                      articles_to_present = existing_articles
-                      note = "\n\n(Note: Displaying stored articles; no new ones fetched.)"
-                 else:
-                      logger.warning(f"No stored articles found for '{location}'")
-                      final_presentation = f"No articles found for {location}."
-                      await metrics_collector.update_system_status("Idle")
-                      total_duration = time.monotonic() - process_start_time
-                      metrics_collector.record_processing_time(total_duration)
-                      logger.warning(f"Summary for '{location}' (no articles):\n{metrics_collector.get_initial_data()}") # Log snapshot
-                      return final_presentation + f"\n\n(Processing time: {total_duration:.2f} seconds)"
-            else:
-                 articles_to_present = new_articles
-
-
-            # 3. Analyze Articles (only if new)
-            analyzed_articles = []
-            if new_articles:
-                 stage_start = time.monotonic()
-                 # Instrument analysis agent if possible, or just time the whole batch
-                 analyzed_articles = await self.analysis_agent.analyze_articles(articles_to_present)
-                 metrics_collector.record_stage_timing("analyze_articles", time.monotonic() - stage_start)
-                 metrics_collector.increment_funnel_count("articles_analyzed", len(analyzed_articles))
-                 metrics_collector.snapshot_resources()
-                 articles_to_present = analyzed_articles
-
-                 # 4. Store Analyzed Articles (async task)
-                 stage_start = time.monotonic()
-                 storage_task = asyncio.create_task(self.storage_agent.save_or_update_articles(analyzed_articles))
-                 metrics_collector.record_stage_timing("storage_initiated", time.monotonic() - stage_start)
-                 metrics_collector.increment_funnel_count("articles_stored", len(analyzed_articles))
-                 # Let storage_task run, no direct timing here unless awaited
-            else:
-                 logger.info("Skipping analysis/storage for stored articles.")
-
-
-            # 5. Generate Presentation
-            stage_start = time.monotonic()
-            presentation = await self.organization_agent.generate_presentation(location, articles_to_present)
-            metrics_collector.record_stage_timing("generate_presentation", time.monotonic() - stage_start)
-            final_presentation = presentation + note
-            metrics_collector.snapshot_resources() # Final check
-
+                logger.warning(f"No sources discovered for '{location}'")
+                return f"No verifiable news sources found for {location}."
+            
+            # Step 2: Process sources to find RSS feeds and extract articles
+            articles = []
+            rss_discovery_start = time.monotonic()
+            
+            # Process each source concurrently
+            source_tasks = []
+            source_task_ids = []
+            
+            for source in sources:
+                # Create tasks for each source
+                source_task_id = await self.task_manager.create_task(
+                    "discover_feeds",
+                    {"source": source.model_dump()},
+                    TaskPriority.MEDIUM
+                )
+                source_task_ids.append(source_task_id)
+                
+            # Wait for all source processing to complete
+            for task_id in source_task_ids:
+                feed_urls = await self.task_manager.get_task_result(task_id)
+                
+                if not feed_urls:
+                    continue
+                
+                # For each feed URL, create a task to fetch and parse
+                feed_task_ids = []
+                for feed_url in feed_urls:
+                    feed_task_id = await self.task_manager.create_task(
+                        "fetch_feed",
+                        {"feed_url": feed_url},
+                        TaskPriority.MEDIUM
+                    )
+                    feed_task_ids.append(feed_task_id)
+                
+                # Process the feeds
+                for feed_task_id in feed_task_ids:
+                    feed_result = await self.task_manager.get_task_result(feed_task_id)
+                    
+                    if feed_result.get("success") and feed_result.get("articles"):
+                        # Add location information to each article
+                        for article in feed_result["articles"]:
+                            article["location_query"] = location
+                            
+                        # Add to the list of articles to process
+                        articles.extend(feed_result["articles"])
+            
+            metrics.record_stage("discover_and_fetch_feeds", rss_discovery_start)
+            metrics.increment_count("feeds_processed", len(source_task_ids))
+            metrics.increment_count("articles_from_feeds", len(articles))
+            
+            if not articles:
+                logger.warning(f"No articles found from RSS feeds for '{location}'")
+                return f"No articles found for {location}."
+            
+            # Step 3: Extract full content for each article
+            extraction_start = time.monotonic()
+            await metrics_collector.update_system_status("Extracting content", location=location, articles=len(articles))
+            
+            # Process articles in batches for efficiency
+            batch_size = 20
+            extracted_articles = []
+            
+            for i in range(0, len(articles), batch_size):
+                batch = articles[i:i+batch_size]
+                
+                # Create a batch extraction task
+                extraction_task_id = await self.task_manager.create_task(
+                    "extract_batch",
+                    {"articles": batch},
+                    TaskPriority.MEDIUM
+                )
+                
+                # Wait for the batch to complete
+                batch_results = await self.task_manager.get_task_result(extraction_task_id)
+                
+                # Filter out failed extractions
+                successful_extractions = [a for a in batch_results if a.get("success", False) and a.get("content")]
+                extracted_articles.extend(successful_extractions)
+            
+            metrics.record_stage("extract_content", extraction_start)
+            metrics.increment_count("articles_extracted", len(extracted_articles))
+            metrics.snapshot_resources()
+            
+            if not extracted_articles:
+                logger.warning(f"No article content could be extracted for '{location}'")
+                return f"No article content could be extracted for {location}."
+            
+            # Step 4: Analyze articles for summaries, importance, and categories
+            analysis_start = time.monotonic()
+            await metrics_collector.update_system_status("Analyzing content", location=location, articles=len(extracted_articles))
+            
+            # Create analysis task
+            analysis_task_id = await self.task_manager.create_task(
+                "analyze_batch",
+                {"articles": extracted_articles},
+                TaskPriority.HIGH
+            )
+            
+            # Wait for analysis to complete
+            analyzed_articles = await self.task_manager.get_task_result(analysis_task_id)
+            
+            metrics.record_stage("analyze_content", analysis_start)
+            metrics.increment_count("articles_analyzed", len(analyzed_articles))
+            metrics.snapshot_resources()
+            
+            if not analyzed_articles:
+                logger.warning(f"No articles were successfully analyzed for '{location}'")
+                return f"No articles could be analyzed for {location}."
+            
+            # Step 5: Generate a summary for the location
+            summary_start = time.monotonic()
+            await metrics_collector.update_system_status("Generating summary", location=location)
+            
+            # Create summary task
+            summary_task_id = await self.task_manager.create_task(
+                "summarize_location",
+                {"location": location, "articles": analyzed_articles},
+                TaskPriority.CRITICAL
+            )
+            
+            # Wait for summary to complete
+            location_summary = await self.task_manager.get_task_result(summary_task_id)
+            
+            metrics.record_stage("generate_summary", summary_start)
+            metrics.snapshot_resources()
+            
+            # Step 6: Format the final presentation
+            presentation_start = time.monotonic()
+            
+            # Sort articles by importance and recency
+            importance_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+            sorted_articles = sorted(
+                analyzed_articles,
+                key=lambda a: (
+                    importance_order.get(a.get("importance", "Medium"), 4),
+                    # Sort by published_at if available, otherwise by order in list
+                    -1 * (a.get("published_at_timestamp", 0) or -1 * analyzed_articles.index(a))
+                )
+            )
+            
+            # Format the presentation
+            presentation = [f"# News from {location}"]
+            presentation.append("")
+            presentation.append(f"## Summary")
+            presentation.append(location_summary)
+            presentation.append("")
+            presentation.append(f"## Top Articles")
+            presentation.append("")
+            
+            # Add top articles by importance
+            for i, article in enumerate(sorted_articles[:15], 1):
+                title = article.get("title", "Untitled")
+                url = article.get("url", "")
+                importance = article.get("importance", "Medium")
+                category = article.get("category", "General")
+                summary = article.get("summary", "No summary available")
+                
+                presentation.append(f"### {i}. {title}")
+                presentation.append(f"**Importance**: {importance} | **Category**: {category}")
+                presentation.append(f"**Link**: {url}")
+                presentation.append(f"{summary}")
+                presentation.append("")
+            
+            metrics.record_stage("format_presentation", presentation_start)
+            
+            # Combine into final presentation
+            final_presentation = "\n".join(presentation)
+            
         except Exception as e:
-            logger.critical(f"!!! Critical error processing '{location}': {e}", exc_info=True)
-            logger.critical(f"Critical system error processing '{location}': {e}")
-            final_presentation = f"An unexpected error occurred while processing {location}. Check logs."
-
-        finally:
-            total_duration = time.monotonic() - process_start_time
-            metrics_collector.record_processing_time(total_duration)
-            await metrics_collector.update_system_status("Idle") # Reset status
-            logger.info(f"===== Finished Processing {location} in {total_duration:.2f} seconds =====")
-            logger.info(f"Final metrics summary for '{location}':\n{self._format_metrics_summary(location)}")
-            final_presentation += f"\n\n(Processing time: {total_duration:.2f} seconds)"
-            pass
-
+            logger.critical(f"Error processing '{location}': {e}", exc_info=True)
+            metrics.add_error(str(e))
+            final_presentation = f"An error occurred while processing news for {location}: {str(e)}"
+        
+        # Finalize metrics
+        metrics.finalize()
+        logger.info(f"Processing for '{location}' completed in {metrics.stage_timings.get('total_duration', 0):.2f}s")
+        logger.info(metrics.get_summary())
+        
+        # Reset system status
+        await metrics_collector.update_system_status("Ready")
+        
         return final_presentation
-    
-    def _format_metrics_summary(self, location: str) -> str:
-        """Creates a concise summary of the metrics for logging."""
-        funnel = metrics_collector.funnel_counts
-        timings = {}
-        
-        # Get stage timings if available
-        with metrics_collector._lock:
-            if hasattr(metrics_collector, 'stage_timings'):
-                timings = metrics_collector.stage_timings
-        
-        summary = [
-            f"===== Metrics Summary for {location} =====",
-            f"Processing Pipeline:",
-            f"  Sources: discovered={funnel.get('sources_discovered', 0)}, verified={funnel.get('sources_verified', 0)}",
-            f"  Articles: fetched={funnel.get('articles_fetched', 0)}, validated={funnel.get('articles_validated', 0)}, analyzed={funnel.get('articles_analyzed', 0)}, stored={funnel.get('articles_stored', 0)}",
-            f"  From DB: {funnel.get('articles_from_db', 0)}",
-            f"  Errors: {funnel.get('errors', 0)}"
-        ]
-        
-        # Add processing time summary
-        if timings:
-            summary.append("\nStage Timings (seconds):")
-            for stage, duration in timings.items():
-                summary.append(f"  - {stage}: {duration:.2f}s")
-        
-        # Add latest LLM metrics if available
-        llm_metrics = {}
-        with metrics_collector._lock:
-            if hasattr(metrics_collector, 'llm_metrics'):
-                for key, metric in metrics_collector.llm_metrics.items():
-                    llm_metrics[key] = f"calls={metric.call_count}, errors={metric.error_count}, avg_latency={round(metric.avg_latency() * 1000) if metric.avg_latency() is not None else 'N/A'}ms"
-        
-        if llm_metrics:
-            summary.append("\nLLM Usage:")
-            for model, stats in llm_metrics.items():
-                summary.append(f"  - {model}: {stats}")
-        
-        # Add resource usage if available
-        with metrics_collector._lock:
-            if hasattr(metrics_collector, 'resource_snapshots') and metrics_collector.resource_snapshots:
-                latest = metrics_collector.resource_snapshots[-1]
-                cpu = latest.get('cpu', 'N/A')
-                memory = latest.get('memory_percent', 'N/A')
-                summary.append(f"\nResource Usage (Latest): CPU {cpu}%, Memory {memory}%")
-        
-        summary.append("=" * 35)
-        return "\n".join(summary)
+
+# Legacy class name alias for backward compatibility
+NewsAggregationSystem = NewsOrchestrator

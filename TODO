@@ -1,5 +1,8 @@
 # TODO / Future Enhancements
 
+
+0 Fix agents
+
 1. Performance optimizations for the crawling process - parallel processing could be enhanced further
 2. Caching improvements to reduce redundant requests and processing
 3. LLM cost optimization by implementing more selective analysis

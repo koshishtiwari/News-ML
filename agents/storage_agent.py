@@ -4,6 +4,7 @@ import aiosqlite
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
+import warnings
 
 # Assuming models are in ../models/
 from models.data_models import NewsArticle
@@ -11,7 +12,12 @@ from models.data_models import NewsArticle
 logger = logging.getLogger(__name__)
 
 class NewsStorageAgent:
-    """Handles persistence of news data in an SQLite database with async support."""
+    """
+    LEGACY: Handles persistence of news data in an SQLite database with async support.
+    
+    This class is maintained for backward compatibility.
+    Please use the micro-agents and task manager for new development.
+    """
 
     def __init__(self, db_path: str):
         self.db_path = Path(db_path).resolve()
@@ -20,6 +26,12 @@ class NewsStorageAgent:
         asyncio.create_task(self._initialize_db_async())
         self._db: Optional[aiosqlite.Connection] = None
         logger.info(f"Storage agent initialized with database at: {self.db_path}")
+        
+        warnings.warn(
+            "NewsStorageAgent is deprecated. Use the new micro-agent architecture instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
 
     def _ensure_db_directory(self):
         """Creates the directory for the database file if it doesn't exist."""
@@ -31,262 +43,244 @@ class NewsStorageAgent:
 
     async def _get_db(self) -> aiosqlite.Connection:
         """Gets a connection to the SQLite database asynchronously."""
-        if self._db is None or self._db.close:
+        if self._db is None or self._db.closed:
             try:
-                # Using aiosqlite for async database operations
-                self._db = await aiosqlite.connect(
-                    self.db_path,
-                    isolation_level=None  # Enable autocommit mode
-                )
-                # Enable foreign keys and configure connection
+                self._db = await aiosqlite.connect(self.db_path)
+                # Enable foreign keys and set pragmas for better performance
                 await self._db.execute("PRAGMA foreign_keys = ON")
-                # Enable row factory to access columns by name
-                self._db.row_factory = aiosqlite.Row
+                await self._db.execute("PRAGMA journal_mode = WAL")
+                await self._db.execute("PRAGMA synchronous = NORMAL")
             except Exception as e:
-                logger.error(f"Failed to connect to database {self.db_path}: {e}", exc_info=True)
+                logger.error(f"Database connection error: {e}", exc_info=True)
                 raise
         return self._db
 
     async def _initialize_db_async(self):
         """Creates the articles table and indexes if they don't already exist."""
-        schema = """
-            CREATE TABLE IF NOT EXISTS articles (
-                url TEXT PRIMARY KEY,
-                title TEXT,
-                source_name TEXT,
-                content TEXT,
-                summary TEXT,
-                published_at TIMESTAMP, -- Store as TEXT ISO8601 recommended for SQLite
-                fetched_at TIMESTAMP NOT NULL, -- Store as TEXT ISO8601 recommended
-                location_query TEXT,
-                category TEXT,
-                importance TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_articles_fetched_at ON articles (fetched_at);
-            CREATE INDEX IF NOT EXISTS idx_articles_location ON articles (location_query);
-            CREATE INDEX IF NOT EXISTS idx_articles_published_at ON articles (published_at);
-            
-            -- Add new table for tracking article metrics
-            CREATE TABLE IF NOT EXISTS article_metrics (
-                url TEXT PRIMARY KEY,
-                view_count INTEGER DEFAULT 0,
-                ratings_sum INTEGER DEFAULT 0,
-                ratings_count INTEGER DEFAULT 0,
-                FOREIGN KEY (url) REFERENCES articles(url) ON DELETE CASCADE
-            );
-        """
+        db = await self._get_db()
         try:
-            db = await self._get_db()
-            await db.executescript(schema)
-            logger.debug("Database schema initialized or verified.")
+            # Create articles table
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS articles (
+                    url TEXT PRIMARY KEY,
+                    title TEXT,
+                    source_name TEXT,
+                    content TEXT,
+                    summary TEXT,
+                    published_at TIMESTAMP,
+                    fetched_at TIMESTAMP NOT NULL,
+                    location_query TEXT,
+                    category TEXT,
+                    importance TEXT
+                )
+            ''')
+            
+            # Create indexes
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_articles_location ON articles(location_query)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_articles_source ON articles(source_name)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_articles_published ON articles(published_at)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_articles_fetched ON articles(fetched_at)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_articles_importance ON articles(importance)')
+            
+            # Create sources table
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS sources (
+                    url TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    location_type TEXT,
+                    reliability_score REAL DEFAULT 0.5
+                )
+            ''')
+            
+            await db.commit()
+            logger.info("Database schema initialized")
         except Exception as e:
-            logger.error(f"Database schema initialization failed: {e}", exc_info=True)
+            logger.error(f"Failed to initialize database schema: {e}", exc_info=True)
             raise
 
-    async def close(self):
-        """Close the database connection when done."""
-        if self._db is not None and not self._db.close:
-            await self._db.close()
-            self._db = None
-            logger.debug("Database connection closed.")
-
-    async def save_or_update_articles(self, articles: List[NewsArticle]) -> int:
-        """
-        Saves or updates a batch of articles in the database using UPSERT.
-        Returns the number of articles successfully saved.
-        """
-        if not articles:
-            logger.debug("No articles provided to save_or_update_articles.")
-            return 0
-
-        sql = """
-            INSERT INTO articles (
-                url, title, source_name, content, summary, published_at,
-                fetched_at, location_query, category, importance
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(url) DO UPDATE SET
-                title=excluded.title,
-                source_name=excluded.source_name,
-                content=excluded.content,
-                summary=excluded.summary,
-                published_at=excluded.published_at,
-                fetched_at=excluded.fetched_at,
-                location_query=excluded.location_query,
-                category=excluded.category,
-                importance=excluded.importance
-            WHERE excluded.fetched_at > articles.fetched_at; -- Only update if newer data
-        """
-        # Convert articles to tuples for executemany, handling datetimes
-        data_to_insert = []
-        for article in articles:
-            published_at_iso = article.published_at.isoformat() if article.published_at else None
-            fetched_at_iso = article.fetched_at.isoformat()  # Should always exist
-
-            data_to_insert.append((
-                article.url, article.title, article.source_name, article.content,
-                article.summary, published_at_iso, fetched_at_iso,
-                article.location_query, article.category, article.importance
+    async def store_article(self, article: NewsArticle) -> bool:
+        """Store a single article in the database."""
+        if not article.url:
+            logger.warning("Attempted to store article with no URL")
+            return False
+            
+        try:
+            db = await self._get_db()
+            
+            # Convert datetime objects to ISO format strings
+            published_at = article.published_at.isoformat() if article.published_at else None
+            fetched_at = article.fetched_at.isoformat() if article.fetched_at else datetime.now(timezone.utc).isoformat()
+            
+            await db.execute('''
+                INSERT OR REPLACE INTO articles 
+                (url, title, source_name, content, summary, published_at, fetched_at, location_query, category, importance)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                article.url,
+                article.title,
+                article.source_name,
+                article.content,
+                article.summary,
+                published_at,
+                fetched_at,
+                article.location_query,
+                article.category,
+                article.importance
             ))
-
-        try:
-            db = await self._get_db()
-            async with db.execute('BEGIN TRANSACTION'):
-                # Use executemany for batch operations
-                await db.executemany(sql, data_to_insert)
-                
-                # Also insert into metrics table for new articles
-                metrics_sql = """
-                    INSERT OR IGNORE INTO article_metrics (url)
-                    VALUES (?)
-                """
-                await db.executemany(metrics_sql, [(article.url,) for article in articles])
-                
-            logger.info(f"Successfully processed (saved/updated) {len(data_to_insert)} articles in database.")
-            return len(data_to_insert)
+            
+            await db.commit()
+            logger.debug(f"Stored article: {article.title} ({article.url})")
+            return True
+            
         except Exception as e:
-            logger.error(f"Database operation failed during save_or_update_articles: {e}", exc_info=True)
+            logger.error(f"Error storing article {article.url}: {e}", exc_info=True)
+            return False
+
+    async def store_articles(self, articles: List[NewsArticle]) -> int:
+        """Store multiple articles in the database."""
+        if not articles:
             return 0
-
-    async def get_articles_by_location(self, location: str, limit: int = 50) -> List[NewsArticle]:
-        """Retrieves recent articles matching a location query from the database."""
-        sql = """
-            SELECT * FROM articles
-            WHERE location_query = ?
-            ORDER BY fetched_at DESC
-            LIMIT ?
-        """
-        articles = []
-        try:
-            db = await self._get_db()
-            async with db.execute(sql, (location, limit)) as cursor:
-                rows = await cursor.fetchall()
-
-                for row in rows:
-                    try:
-                        # Convert ISO strings back to timezone-aware datetimes (assuming UTC)
-                        published_at = datetime.fromisoformat(p_at).replace(tzinfo=timezone.utc) if (p_at := row['published_at']) else None
-                        fetched_at = datetime.fromisoformat(f_at).replace(tzinfo=timezone.utc) if (f_at := row['fetched_at']) else None # Should exist
-
-                        articles.append(NewsArticle(
-                            url=row['url'],
-                            title=row['title'],
-                            source_name=row['source_name'],
-                            content=row['content'],
-                            summary=row['summary'],
-                            published_at=published_at,
-                            fetched_at=fetched_at,
-                            location_query=row['location_query'],
-                            category=row['category'],
-                            importance=row['importance']
-                        ))
-                    except (ValueError, TypeError) as e:
-                        logger.warning(f"Skipping article row due to data conversion error (URL: {row.get('url', 'N/A')}): {e}")
-
-            logger.info(f"Retrieved {len(articles)} articles for location '{location}' from DB.")
-            return articles
-        except Exception as e:
-            logger.error(f"Failed to retrieve articles for location '{location}': {e}", exc_info=True)
-            return []
             
-    async def search_articles_by_keyword(self, keyword: str, limit: int = 50) -> List[NewsArticle]:
-        """Search for articles containing a specific keyword in title or content."""
-        search_term = f"%{keyword}%"
-        sql = """
-            SELECT * FROM articles 
-            WHERE title LIKE ? OR content LIKE ?
-            ORDER BY fetched_at DESC
-            LIMIT ?
-        """
-        
-        articles = []
-        try:
-            db = await self._get_db()
-            async with db.execute(sql, (search_term, search_term, limit)) as cursor:
-                rows = await cursor.fetchall()
+        success_count = 0
+        for article in articles:
+            if await self.store_article(article):
+                success_count += 1
                 
-                for row in rows:
-                    try:
-                        # Convert ISO strings back to timezone-aware datetimes
-                        published_at = datetime.fromisoformat(p_at).replace(tzinfo=timezone.utc) if (p_at := row['published_at']) else None
-                        fetched_at = datetime.fromisoformat(f_at).replace(tzinfo=timezone.utc) if (f_at := row['fetched_at']) else None
-                        
-                        articles.append(NewsArticle(
-                            url=row['url'],
-                            title=row['title'],
-                            source_name=row['source_name'],
-                            content=row['content'],
-                            summary=row['summary'],
-                            published_at=published_at,
-                            fetched_at=fetched_at,
-                            location_query=row['location_query'],
-                            category=row['category'],
-                            importance=row['importance']
-                        ))
-                    except (ValueError, TypeError) as e:
-                        logger.warning(f"Skipping article row due to data conversion error (URL: {row.get('url', 'N/A')}): {e}")
-                        
-            logger.info(f"Found {len(articles)} articles containing keyword '{keyword}'")
-            return articles
-        except Exception as e:
-            logger.error(f"Failed to search articles by keyword '{keyword}': {e}", exc_info=True)
-            return []
-    
-    async def get_article_stats(self) -> Dict[str, Any]:
-        """Get statistics about the articles database."""
-        try:
-            db = await self._get_db()
-            stats = {}
-            
-            # Total article count
-            async with db.execute("SELECT COUNT(*) FROM articles") as cursor:
-                stats["total_articles"] = (await cursor.fetchone())[0]
-                
-            # Articles per category
-            categories = {}
-            async with db.execute("SELECT category, COUNT(*) FROM articles GROUP BY category") as cursor:
-                async for row in cursor:
-                    categories[row[0] or "Uncategorized"] = row[1]
-            stats["articles_by_category"] = categories
-            
-            # Articles per importance level
-            importance = {}
-            async with db.execute("SELECT importance, COUNT(*) FROM articles GROUP BY importance") as cursor:
-                async for row in cursor:
-                    importance[row[0] or "Unrated"] = row[1]
-            stats["articles_by_importance"] = importance
-            
-            # Most frequent locations
-            locations = []
-            async with db.execute(
-                "SELECT location_query, COUNT(*) as count FROM articles GROUP BY location_query ORDER BY count DESC LIMIT 10"
-            ) as cursor:
-                async for row in cursor:
-                    if row[0]:  # Avoid None values
-                        locations.append({"location": row[0], "count": row[1]})
-            stats["top_locations"] = locations
-            
-            return stats
-        except Exception as e:
-            logger.error(f"Failed to gather article statistics: {e}", exc_info=True)
-            return {"error": str(e)}
+        logger.info(f"Stored {success_count}/{len(articles)} articles to database")
+        return success_count
 
-    async def cleanup_old_articles(self, days_to_keep: int = 30) -> int:
-        """Remove articles older than the specified number of days."""
+    async def get_articles_for_location(self, location: str, limit: int = 50) -> List[NewsArticle]:
+        """Retrieve articles for a specific location."""
         try:
-            from datetime import timedelta
-            
-            cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days_to_keep)).isoformat()
-            
             db = await self._get_db()
-            async with db.execute("BEGIN TRANSACTION"):
-                async with db.execute(
-                    "DELETE FROM articles WHERE fetched_at < ?", 
-                    (cutoff_date,)
-                ) as cursor:
-                    deleted_count = cursor.rowcount
             
-            logger.info(f"Removed {deleted_count} articles older than {days_to_keep} days")
-            return deleted_count
+            # Get the most recent articles for this location
+            async with db.execute('''
+                SELECT url, title, source_name, content, summary, published_at, fetched_at, 
+                       location_query, category, importance
+                FROM articles
+                WHERE location_query = ?
+                ORDER BY 
+                    CASE importance
+                        WHEN 'Critical' THEN 1
+                        WHEN 'High' THEN 2
+                        WHEN 'Medium' THEN 3
+                        WHEN 'Low' THEN 4
+                        ELSE 5
+                    END,
+                    COALESCE(published_at, fetched_at) DESC
+                LIMIT ?
+            ''', (location, limit)) as cursor:
+                
+                articles = []
+                async for row in cursor:
+                    # Convert ISO format strings back to datetime objects
+                    published_at = None
+                    if row[5]:  # published_at
+                        try:
+                            published_at = datetime.fromisoformat(row[5])
+                        except ValueError:
+                            pass
+                            
+                    fetched_at = None
+                    if row[6]:  # fetched_at
+                        try:
+                            fetched_at = datetime.fromisoformat(row[6])
+                        except ValueError:
+                            fetched_at = datetime.now(timezone.utc)
+                    
+                    # Create NewsArticle object
+                    article = NewsArticle(
+                        url=row[0],
+                        title=row[1],
+                        source_name=row[2],
+                        content=row[3],
+                        summary=row[4],
+                        published_at=published_at,
+                        fetched_at=fetched_at,
+                        location_query=row[7],
+                        category=row[8],
+                        importance=row[9]
+                    )
+                    
+                    articles.append(article)
+                    
+            logger.info(f"Retrieved {len(articles)} articles for location '{location}'")
+            return articles
+            
         except Exception as e:
-            logger.error(f"Failed to clean up old articles: {e}", exc_info=True)
-            return 0
+            logger.error(f"Error retrieving articles for location '{location}': {e}", exc_info=True)
+            return []
+
+    async def get_recent_articles(self, limit: int = 30) -> List[NewsArticle]:
+        """Retrieve the most recent articles across all locations."""
+        try:
+            db = await self._get_db()
+            
+            # Get the most recent articles
+            async with db.execute('''
+                SELECT url, title, source_name, content, summary, published_at, fetched_at, 
+                       location_query, category, importance
+                FROM articles
+                ORDER BY 
+                    CASE importance
+                        WHEN 'Critical' THEN 1
+                        WHEN 'High' THEN 2
+                        WHEN 'Medium' THEN 3
+                        WHEN 'Low' THEN 4
+                        ELSE 5
+                    END,
+                    COALESCE(published_at, fetched_at) DESC
+                LIMIT ?
+            ''', (limit,)) as cursor:
+                
+                articles = []
+                async for row in cursor:
+                    # Convert ISO format strings back to datetime objects
+                    published_at = None
+                    if row[5]:  # published_at
+                        try:
+                            published_at = datetime.fromisoformat(row[5])
+                        except ValueError:
+                            pass
+                            
+                    fetched_at = None
+                    if row[6]:  # fetched_at
+                        try:
+                            fetched_at = datetime.fromisoformat(row[6])
+                        except ValueError:
+                            fetched_at = datetime.now(timezone.utc)
+                    
+                    # Create NewsArticle object
+                    article = NewsArticle(
+                        url=row[0],
+                        title=row[1],
+                        source_name=row[2],
+                        content=row[3],
+                        summary=row[4],
+                        published_at=published_at,
+                        fetched_at=fetched_at,
+                        location_query=row[7],
+                        category=row[8],
+                        importance=row[9]
+                    )
+                    
+                    articles.append(article)
+                    
+            logger.info(f"Retrieved {len(articles)} recent articles")
+            return articles
+            
+        except Exception as e:
+            logger.error(f"Error retrieving recent articles: {e}", exc_info=True)
+            return []
+
+    async def close(self):
+        """Close the database connection."""
+        if self._db:
+            try:
+                await self._db.close()
+                self._db = None
+                logger.debug("Database connection closed")
+            except Exception as e:
+                logger.error(f"Error closing database: {e}", exc_info=True)
