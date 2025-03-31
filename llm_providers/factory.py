@@ -3,6 +3,8 @@ import logging
 from .base import LLMProvider
 from .ollama import OllamaLLM
 from .gemini import GeminiLLM  # Import the implemented GeminiLLM
+from .openai import OpenAILLM
+from .anthropic import AnthropicLLM
 
 # Import config (make sure this doesn't create circular dependencies)
 from config import (
@@ -12,13 +14,14 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-def create_llm_provider(provider_type: str, model: str = None) -> LLMProvider:
+def create_llm_provider(provider_type: str, model: str = None, api_key: str = None) -> LLMProvider:
     """
     Factory function to create an instance of an LLM provider.
 
     Args:
         provider_type: The type of provider (e.g., "ollama", "gemini").
         model: The specific model name to use.
+        api_key: The API key for the provider (if required).
 
     Returns:
         An instance of the requested LLMProvider.
@@ -38,18 +41,17 @@ def create_llm_provider(provider_type: str, model: str = None) -> LLMProvider:
             request_timeout=OLLAMA_REQUEST_TIMEOUT
         )
     elif provider_type == "gemini":
-         if not GEMINI_API_KEY:
-             raise ValueError("GEMINI_API_KEY not found in environment variables.")
-         # Use provided model or default to gemini-1.5-flash
-         model = model or "gemini-1.5-flash"
-         return GeminiLLM(api_key=GEMINI_API_KEY, model=model)
+        if not api_key:
+            raise ValueError("API key is required for Gemini provider.")
+        model = model or "gemini-1.5-flash"
+        return GeminiLLM(api_key=api_key, model=model)
     elif provider_type == "openai":
-         if not OPENAI_API_KEY:
-              raise ValueError("OPENAI_API_KEY not found in environment variables.")
-         raise NotImplementedError("OpenAI provider not yet fully implemented in factory.")
+        if not api_key:
+            raise ValueError("API key is required for OpenAI provider.")
+        return OpenAILLM(api_key=api_key, model=model)
     elif provider_type == "anthropic":
-         if not ANTHROPIC_API_KEY:
-              raise ValueError("ANTHROPIC_API_KEY not found in environment variables.")
-         raise NotImplementedError("Anthropic provider not yet fully implemented in factory.")
+        if not api_key:
+            raise ValueError("API key is required for Anthropic provider.")
+        return AnthropicLLM(api_key=api_key, model=model)
     else:
         raise ValueError(f"Unsupported LLM provider type: '{provider_type}'.")

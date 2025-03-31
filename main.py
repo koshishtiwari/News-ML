@@ -137,30 +137,54 @@ async def run_news_system(run_monitor: bool, monitor_host: str, monitor_port: in
         # Determine provider/model based on args or interactive input
         provider_type = args.provider
         model_name = args.model
+        api_key = None
         is_interactive = not args.location and sys.stdin.isatty()
 
-        if is_interactive and not args.provider: # Allow override if interactive
-             provider_type = input(f"Enter LLM provider (ollama, gemini, ...) [default: {args.provider}]: ").strip().lower() or args.provider
+        if is_interactive:
+            # Prompt to select LLM provider
+            provider_type = input("Select LLM provider (ollama, gemini, openai, anthropic): ").strip().lower()
+            if provider_type not in ["ollama", "gemini", "openai", "anthropic"]:
+                logger.error(f"Invalid provider selected: {provider_type}")
+                continue
 
         try:
-            if provider_type == "ollama" and not model_name:
-                 if args.location or not is_interactive: # Non-interactive requires model
-                     logger.error("Ollama model name required (--model) for non-interactive mode.")
-                     # Cannot proceed without model, exit or raise
-                     raise ValueError("Ollama model required.")
-                 model_name = input("Enter the EXACT Ollama model name (e.g., gemma:2b): ").strip()
-                 if not model_name: raise ValueError("Ollama model name cannot be empty.") # Validate input
+            if provider_type == "ollama":
+                if not model_name:
+                    model_name = input("Enter the EXACT Ollama model name (e.g., gemma:2b): ").strip()
+                    if not model_name:
+                        raise ValueError("Ollama model name cannot be empty.")
+                llm_provider = create_llm_provider(provider_type, model=model_name)
 
-            llm_provider = create_llm_provider(provider_type, model=model_name)
-            logger.info(f"Using LLM Provider: {type(llm_provider).__name__} with model '{model_name or 'default'}'")
+            elif provider_type == "gemini":
+                if is_interactive:
+                    api_key = input("Enter Gemini API key: ").strip()
+                    model_name = input("Enter Gemini model name (default: gemini-1.5-flash): ").strip() or "gemini-1.5-flash"
+                if not api_key:
+                    logger.error("Gemini API key is required.")
+                    continue
+                llm_provider = create_llm_provider(provider_type, model=model_name)
+                # Pass the API key to the Gemini provider (handled in factory)
+
+            elif provider_type in ["openai", "anthropic"]:
+                if is_interactive:
+                    api_key = input(f"Enter {provider_type.capitalize()} API key: ").strip()
+                    model_name = input(f"Enter {provider_type.capitalize()} model name: ").strip()
+                if not api_key or not model_name:
+                    logger.error(f"{provider_type.capitalize()} API key and model name are required.")
+                    continue
+                llm_provider = create_llm_provider(provider_type, model=model_name)
+                # Pass the API key to the respective provider (handled in factory)
+
+            logger.info(f"Using LLM Provider: {type(llm_provider).__name__} with model '{model_name}'")
 
         except (ValueError, NotImplementedError) as e:
             logger.error(f"LLM Provider Error: {e}")
-            if args.location: sys.exit(1) # Exit non-interactive on error
+            if args.location:
+                sys.exit(1)  # Exit non-interactive on error
             # Loop again for interactive mode
         except Exception as e:
-             logger.critical(f"Failed during LLM setup: {e}", exc_info=True)
-             sys.exit(1)
+            logger.critical(f"Failed during LLM setup: {e}", exc_info=True)
+            sys.exit(1)
 
 
     # --- System Initialization ---
