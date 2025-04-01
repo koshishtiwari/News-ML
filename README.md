@@ -134,3 +134,13 @@ The system includes a RESTful API for accessing news data:
 | `ANTHROPIC_API_KEY` | API key for Anthropic | None |
 | `DATABASE_PATH` | Path to SQLite database | ./data/news_archive.db |
 | `DEFAULT_TIMEZONE` | Default timezone for timestamps | UTC |
+## Architecture
+
+This project uses a micro-agent architecture where specialized agents handle specific tasks:
+
+- **Source Discovery Agent**: Identifies news sources for a location
+- **RSS Discovery Agent**: Finds and processes RSS feeds
+- **Content Extraction Agent**: Extracts and cleans article content
+- **Content Analysis Agent**: Analyzes article content using LLM
+
+The system is coordinated by the **NewsOrchestrator** which manages the workflow between agents through a task manager.

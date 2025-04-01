@@ -162,8 +162,8 @@ async def run_news_system(run_monitor: bool, monitor_host: str, monitor_port: in
                 if not api_key:
                     logger.error("Gemini API key is required.")
                     continue
-                llm_provider = create_llm_provider(provider_type, model=model_name)
-                # Pass the API key to the Gemini provider (handled in factory)
+                llm_provider = create_llm_provider(provider_type, model=model_name, api_key=api_key)
+                # API key is now passed to the Gemini provider
 
             elif provider_type in ["openai", "anthropic"]:
                 if is_interactive:
@@ -172,8 +172,8 @@ async def run_news_system(run_monitor: bool, monitor_host: str, monitor_port: in
                 if not api_key or not model_name:
                     logger.error(f"{provider_type.capitalize()} API key and model name are required.")
                     continue
-                llm_provider = create_llm_provider(provider_type, model=model_name)
-                # Pass the API key to the respective provider (handled in factory)
+                llm_provider = create_llm_provider(provider_type, model=model_name, api_key=api_key)
+                # API key is now passed to the respective provider
 
             logger.info(f"Using LLM Provider: {type(llm_provider).__name__} with model '{model_name}'")
 
@@ -193,6 +193,12 @@ async def run_news_system(run_monitor: bool, monitor_host: str, monitor_port: in
         # Set the system reference in metrics_collector
         metrics_collector.set_news_system(system)
         logger.info("News system reference set in metrics collector")
+        
+        # Initialize the system and wait for it to be ready
+        logger.info("Initializing news system...")
+        await system.initialize()
+        logger.info("News system initialized and ready")
+        
     except Exception as e:
         logger.critical(f"Failed to initialize NewsAggregationSystem: {e}", exc_info=True)
         sys.exit(1)
@@ -231,6 +237,15 @@ async def run_news_system(run_monitor: bool, monitor_host: str, monitor_port: in
 
 
     logger.info("News Agent System shutting down.")
+    
+    # Properly shutdown the news system
+    try:
+        logger.info("Shutting down news system...")
+        await system.shutdown()
+        logger.info("News system shutdown complete")
+    except Exception as e:
+        logger.error(f"Error shutting down news system: {e}")
+    
     # --- Stop Monitor Background Tasks ---
     if run_monitor:
          logger.info("Stopping monitor background tasks...")

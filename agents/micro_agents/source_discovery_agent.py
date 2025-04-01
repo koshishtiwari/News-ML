@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 from models.data_models import NewsSource
 from llm_providers.base import LLMProvider
-from .base_agent import BaseAgent, Task, TaskPriority
+from ..base_agent import BaseAgent, Task, TaskPriority
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +49,7 @@ class SourceDiscoveryAgent(BaseAgent):
             raise ValueError(f"Unknown task type: {task_type}")
             
     async def _discover_sources(self, task: Task) -> List[NewsSource]:
-        """Discover news sources for a location using LLM"""
+        """Discover news sources for a location using fallback sources"""
         location = task.data.get("location")
         if not location:
             raise ValueError("Location is required for source discovery")
@@ -58,7 +58,7 @@ class SourceDiscoveryAgent(BaseAgent):
         
         await self.update_status("Discovering sources", {"location": location, "limit": limit})
         
-        # Use LLM to generate potential sources
+        # Use fallback sources to generate potential sources
         sources = await self._generate_source_candidates(location, limit)
         logger.info(f"Generated {len(sources)} source candidates for {location}")
         
@@ -125,66 +125,64 @@ class SourceDiscoveryAgent(BaseAgent):
             }
     
     async def _generate_source_candidates(self, location: str, limit: int = 10) -> List[NewsSource]:
-        """Use LLM to generate potential news sources for a location"""
-        # Prompt the LLM to generate source suggestions in JSON format
-        prompt = f"""
-        I need to find reliable news sources for {location}. Please provide a list of {limit} news sources 
-        with the following details:
-        - News source name
-        - Homepage URL (full URL starting with https://)
-        - Type of news coverage (Local, National/Local, National, or International)
+        """Use fallback sources to generate potential news sources for a location"""
+        logger.info(f"Starting source candidate generation for location: {location}")
         
-        Your response should be a valid JSON array with objects containing 'name', 'url', and 'location_type' keys.
-        Only include sources you're confident exist and are reliable.
-        """
+        # Skip LLM entirely and just use fallback sources
+        # This is a more reliable approach until LLM issues are resolved
+        logger.info(f"Using reliable fallback sources for {location}")
+        return self._create_fallback_sources(location)
         
-        result = await self.llm_provider.generate(prompt)
+    def _create_fallback_sources(self, location: str) -> List[NewsSource]:
+        """Create a fallback list of news sources for when LLM fails"""
+        fallback_sources = []
+        location_lower = location.lower()
         
-        # Try to extract JSON from response
-        sources = []
-        try:
-            # Find JSON array in the response using regex
-            json_match = re.search(r'\[\s*\{.*\}\s*\]', result, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(0)
-                sources_data = json.loads(json_str)
-                
-                # Convert to NewsSource objects
-                for source_data in sources_data:
-                    try:
-                        source = NewsSource(
-                            name=source_data.get("name", "Unknown"),
-                            url=source_data.get("url", ""),
-                            location_type=source_data.get("location_type", "Local"),
-                            reliability_score=0.5  # Default score until verified
-                        )
-                        sources.append(source)
-                    except Exception as e:
-                        logger.warning(f"Failed to parse source: {source_data}. Error: {e}")
-            else:
-                logger.warning(f"No valid JSON found in LLM response for {location}")
-                # Try to extract data using regex as fallback
-                urls = re.findall(r'https?://[^\s\'"]+', result)
-                names = re.findall(r'(?:^|\n)(?:- |• |• )?([A-Z][A-Za-z\s]{2,50})(?:\s*[-:–]|$)', result, re.MULTILINE)
-                
-                # Create sources from extracted data
-                for i, url in enumerate(urls[:limit]):
-                    name = names[i] if i < len(names) else f"News Source {i+1}"
-                    try:
-                        source = NewsSource(
-                            name=name,
-                            url=url,
-                            location_type="Unknown",
-                            reliability_score=0.3  # Lower score for regex-extracted sources
-                        )
-                        sources.append(source)
-                    except Exception as e:
-                        logger.warning(f"Failed to create source from URL {url}. Error: {e}")
-                        
-        except Exception as e:
-            logger.error(f"Error parsing LLM response for {location}: {e}", exc_info=True)
+        # Expanded fallback sources with reliable news outlets
+        if "nyc" in location_lower or "new york" in location_lower:
+            fallback_sources = [
+                NewsSource(name="New York Times", url="https://www.nytimes.com/", location_type="National/Local", reliability_score=0.9),
+                NewsSource(name="New York Post", url="https://nypost.com/", location_type="Local", reliability_score=0.7),
+                NewsSource(name="NY1", url="https://www.ny1.com/", location_type="Local", reliability_score=0.8),
+                NewsSource(name="Gothamist", url="https://gothamist.com/", location_type="Local", reliability_score=0.8),
+                NewsSource(name="amNY", url="https://www.amny.com/", location_type="Local", reliability_score=0.7)
+            ]
+        elif "la" in location_lower or "los angeles" in location_lower:
+            fallback_sources = [
+                NewsSource(name="Los Angeles Times", url="https://www.latimes.com/", location_type="National/Local", reliability_score=0.9),
+                NewsSource(name="LA Daily News", url="https://www.dailynews.com/", location_type="Local", reliability_score=0.8),
+                NewsSource(name="LAist", url="https://laist.com/", location_type="Local", reliability_score=0.8)
+            ]
+        elif "chicago" in location_lower:
+            fallback_sources = [
+                NewsSource(name="Chicago Tribune", url="https://www.chicagotribune.com/", location_type="National/Local", reliability_score=0.9),
+                NewsSource(name="Chicago Sun-Times", url="https://chicago.suntimes.com/", location_type="Local", reliability_score=0.8),
+                NewsSource(name="Block Club Chicago", url="https://blockclubchicago.org/", location_type="Local", reliability_score=0.8)
+            ]
+        elif "london" in location_lower:
+            fallback_sources = [
+                NewsSource(name="BBC London", url="https://www.bbc.co.uk/news/england/london", location_type="Local", reliability_score=0.9),
+                NewsSource(name="Evening Standard", url="https://www.standard.co.uk/", location_type="Local", reliability_score=0.8),
+                NewsSource(name="The Guardian London", url="https://www.theguardian.com/uk/london", location_type="Local", reliability_score=0.9)
+            ]
+        elif "tokyo" in location_lower:
+            fallback_sources = [
+                NewsSource(name="The Japan Times", url="https://www.japantimes.co.jp/", location_type="National/Local", reliability_score=0.8),
+                NewsSource(name="Tokyo Weekender", url="https://www.tokyoweekender.com/", location_type="Local", reliability_score=0.7),
+                NewsSource(name="NHK World", url="https://www3.nhk.or.jp/nhkworld/", location_type="National", reliability_score=0.9)
+            ]
+        else:
+            # Generic national sources for any location
+            fallback_sources = [
+                NewsSource(name="CNN", url="https://www.cnn.com/", location_type="National", reliability_score=0.8),
+                NewsSource(name="BBC News", url="https://www.bbc.com/news", location_type="International", reliability_score=0.9),
+                NewsSource(name="Reuters", url="https://www.reuters.com/", location_type="International", reliability_score=0.9),
+                NewsSource(name="Associated Press", url="https://apnews.com/", location_type="International", reliability_score=0.9),
+                NewsSource(name="The New York Times", url="https://www.nytimes.com/", location_type="National", reliability_score=0.9)
+            ]
             
-        return sources
+        logger.info(f"Created {len(fallback_sources)} fallback sources for {location}")
+        return fallback_sources
     
     @staticmethod
     def _extract_title(html_content: str) -> Optional[str]:

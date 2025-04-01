@@ -180,6 +180,22 @@ class TaskManager:
         self.agent_by_id[agent.agent_id] = agent
         logger.info(f"Registered agent: {agent.agent_id} of type {agent.agent_type}")
         
+    def register_agent_for_task_types(self, agent: BaseAgent, task_types: List[str]):
+        """Register an agent to handle specific task types
+        
+        Args:
+            agent: The agent to register
+            task_types: List of task types this agent can handle
+        """
+        # First register the agent normally
+        self.agent_by_id[agent.agent_id] = agent
+        
+        # Then register for each task type
+        for task_type in task_types:
+            self.agents[task_type].append(agent)
+            
+        logger.info(f"Registered agent: {agent.agent_id} for task types: {', '.join(task_types)}")
+        
     async def create_task(self, 
                         task_type: str, 
                         data: Dict[str, Any] = None,
@@ -235,43 +251,63 @@ class TaskManager:
         """Get the result of a task, waiting if necessary"""
         # If already completed, return result
         if task_id in self.task_results:
+            logger.info(f"Task {task_id} result found immediately in cache")
             return self.task_results[task_id]
             
         # Otherwise wait for task to complete
+        logger.info(f"Waiting for task {task_id} to complete (timeout={timeout}s)")
         start_time = time.monotonic()
+        wait_count = 0
+        
         while timeout is None or (time.monotonic() - start_time < timeout):
             if task_id in self.task_results:
+                logger.info(f"Task {task_id} result found after {time.monotonic() - start_time:.2f}s")
                 return self.task_results[task_id]
                 
             if task_id in self.completed_tasks:
                 task = self.completed_tasks[task_id]
                 if task.is_failed:
+                    logger.warning(f"Task {task_id} failed: {task.error}")
                     raise task.error or RuntimeError(f"Task {task_id} failed without specific error")
                     
+                logger.info(f"Task {task_id} found in completed_tasks after {time.monotonic() - start_time:.2f}s")
                 self.task_results[task_id] = task.result
                 return task.result
+            
+            wait_count += 1
+            if wait_count % 10 == 0:  # Log every 10 waits (about 1 second)
+                elapsed = time.monotonic() - start_time
+                logger.info(f"Still waiting for task {task_id} after {elapsed:.2f}s")
                 
             await asyncio.sleep(0.1)
             
+        logger.error(f"Timeout waiting for task {task_id} after {timeout}s")
         raise asyncio.TimeoutError(f"Timeout waiting for task {task_id}")
         
     async def start(self):
         """Start processing tasks"""
         if self.running:
+            logger.info("TaskManager is already running - skipping start")
             return
             
         self.running = True
         
         # Create worker tasks
+        logger.info(f"Creating {self.max_concurrent_tasks} worker tasks")
         for i in range(self.max_concurrent_tasks):
             worker = asyncio.create_task(self._worker_loop(f"worker-{i}"))
             self._workers.append(worker)
             
         # Start the scheduler loop
+        logger.info("Creating scheduler task")
         scheduler = asyncio.create_task(self._scheduler_loop())
         self._workers.append(scheduler)
         
         logger.info(f"TaskManager started with {self.max_concurrent_tasks} workers")
+
+        # Log the worker status after a brief delay to ensure they're running
+        await asyncio.sleep(0.5)
+        self._log_worker_status()
         
     async def _worker_loop(self, worker_id: str):
         """Worker loop that processes tasks"""
@@ -290,23 +326,43 @@ class TaskManager:
                 agent = await self._get_available_agent(task.task_type)
                 
                 if not agent:
+                    logger.warning(f"No available agent found for task type: {task.task_type}, retrying later")
                     # No agent available, put task back and sleep
                     self.task_queue.add_task(task)
                     await asyncio.sleep(0.5)
                     continue
                     
                 # Process the task
-                logger.debug(f"Worker {worker_id} processing task {task.task_id} with agent {agent.agent_id}")
+                logger.info(f"Worker {worker_id} processing task {task.task_id} with agent {agent.agent_id}")
                 
                 try:
-                    result = await agent.process_task(task)
-                    self.task_queue.mark_task_completed(task.task_id, result)
-                    self.completed_tasks[task.task_id] = task
-                    self.task_results[task.task_id] = result
+                    # Add a stricter timeout to task processing
+                    task_timeout = 60  # 1 minute max for any task
+                    
+                    try:
+                        result = await asyncio.wait_for(
+                            agent.process_task(task),
+                            timeout=task_timeout
+                        )
+                        logger.info(f"Task {task.task_id} completed successfully")
+                        self.task_queue.mark_task_completed(task.task_id, result)
+                        self.completed_tasks[task.task_id] = task
+                        self.task_results[task.task_id] = result
+                    except asyncio.TimeoutError:
+                        logger.error(f"Task {task.task_id} timed out after {task_timeout} seconds")
+                        error = TimeoutError(f"Task processing timed out after {task_timeout} seconds")
+                        self.task_queue.mark_task_failed(task.task_id, error)
+                        self.completed_tasks[task.task_id] = task
+                        self.task_results[task.task_id] = {"error": f"Timeout after {task_timeout}s", "fallback": True}
+                        
+                        # Try to recover the agent
+                        await agent._try_recovery()
+                        
                 except Exception as e:
                     logger.error(f"Error processing task {task.task_id}: {str(e)}", exc_info=True)
                     self.task_queue.mark_task_failed(task.task_id, e)
                     self.completed_tasks[task.task_id] = task
+                    self.task_results[task.task_id] = {"error": str(e), "fallback": True}
                     
             except Exception as e:
                 logger.error(f"Error in worker {worker_id}: {str(e)}", exc_info=True)
@@ -378,3 +434,41 @@ class TaskManager:
     def get_all_agent_stats(self) -> Dict[str, Dict]:
         """Get stats from all agents"""
         return {agent_id: agent.get_stats() for agent_id, agent in self.agent_by_id.items()}
+    
+    def _log_worker_status(self):
+        """Log detailed status of worker tasks to help with debugging"""
+        running_workers = 0
+        done_workers = 0
+        cancelled_workers = 0
+        exception_workers = 0
+        
+        for i, worker in enumerate(self._workers):
+            if worker.done():
+                if worker.cancelled():
+                    cancelled_workers += 1
+                elif worker.exception() is not None:
+                    exception_workers += 1
+                else:
+                    done_workers += 1
+            else:
+                running_workers += 1
+        
+        logger.info(f"Worker status: Running={running_workers}, Done={done_workers}, "
+                    f"Cancelled={cancelled_workers}, Exception={exception_workers}")
+        
+        # Log agent statuses
+        agent_counts = defaultdict(int)
+        for agent_type, agents in self.agents.items():
+            for agent in agents:
+                agent_counts[agent.state.value] += 1
+            
+            logger.info(f"Agent type '{agent_type}' count: {len(agents)}")
+        
+        logger.info(f"Agent states: {dict(agent_counts)}")
+        
+        # Check specifically for source_discovery agents
+        if 'source_discovery' in self.agents:
+            logger.info(f"Source discovery agents: {len(self.agents['source_discovery'])}")
+            for i, agent in enumerate(self.agents['source_discovery']):
+                logger.info(f"  Agent {i+1}: {agent.agent_id}, State: {agent.state.value}, "
+                           f"Current task: {agent.current_task.task_id if agent.current_task else 'None'}")

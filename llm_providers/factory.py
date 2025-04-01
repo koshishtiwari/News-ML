@@ -6,6 +6,7 @@ from .base import LLMProvider
 from .ollama import OllamaLLM
 from .openai import OpenAILLM
 from .claude import ClaudeLLM
+from .gemini import GeminiLLM  # Make sure to import GeminiLLM
 # Add imports for other providers as they're created
 
 logger = logging.getLogger(__name__)
@@ -20,20 +21,21 @@ class LLMFactory:
         
         Args:
             config: Dictionary containing provider configuration
-                - provider: Type of provider (ollama, openai, claude, etc.)
+                - provider: Type of provider (ollama, openai, claude, gemini, etc.)
                 - model: Model name to use
                 - Other provider-specific config (api_key, base_url, etc.)
                 
         Returns:
             An instance of LLMProvider or None if configuration is invalid
         """
+        logger.info(f"Creating LLM provider with config: {config}")
         provider_type = config.get("provider", "").lower()
         model = config.get("model")
         
         if not model:
             logger.error("No model specified in LLM configuration")
             return None
-            
+        
         try:
             if provider_type == "ollama":
                 base_url = config.get("base_url", "http://localhost:11434")
@@ -85,6 +87,21 @@ class LLMFactory:
                     retry_delay=retry_delay
                 )
                 
+            elif provider_type == "gemini":  # Add support for Gemini
+                api_key = config.get("api_key")
+                if not api_key:
+                    logger.error("No API key provided for Gemini")
+                    return None
+                
+                request_timeout = int(config.get("request_timeout", 30))
+                
+                logger.info(f"Creating GeminiLLM with model: {model} and api_key: {api_key[:4]}...{api_key[-4:] if len(api_key) > 8 else ''}")
+                return GeminiLLM(
+                    model=model,
+                    api_key=api_key,
+                    request_timeout=request_timeout
+                )
+                
             # Add more provider types as needed
                 
             else:
@@ -94,3 +111,22 @@ class LLMFactory:
         except Exception as e:
             logger.error(f"Error creating LLM provider '{provider_type}': {e}", exc_info=True)
             return None
+
+def create_llm_provider(provider_type: str, model: str, **kwargs) -> Optional[LLMProvider]:
+    """
+    Helper function to create an LLM provider by constructing a config dictionary.
+    
+    Args:
+        provider_type: Type of provider (ollama, openai, claude, gemini, etc.)
+        model: Model name to use
+        **kwargs: Additional provider-specific configuration
+        
+    Returns:
+        An instance of LLMProvider or None if configuration is invalid
+    """
+    config = {
+        "provider": provider_type,
+        "model": model,
+        **kwargs
+    }
+    return LLMFactory.create_provider(config)
