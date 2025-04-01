@@ -2,7 +2,7 @@ import logging
 from fastapi import FastAPI, HTTPException, Query, Depends
 from typing import List, Dict, Any, Optional
 import asyncio
-from models.data_models import NewsArticle
+from models.data_models import NewsArticle, ImportanceLevel
 from agents.storage_agent import NewsStorageAgent
 from models.vector_store import ArticleVectorStore
 import config
@@ -52,6 +52,30 @@ async def get_articles_by_location(
         return [article.to_dict() for article in articles]
     except Exception as e:
         logger.error(f"Error retrieving articles for location '{location}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@app.get("/api/articles/importance/{importance_level}", response_model=List[Dict[str, Any]])
+async def get_articles_by_importance(
+    importance_level: str,
+    limit: int = Query(20, ge=1, le=100),
+    storage: NewsStorageAgent = Depends(get_storage_agent)
+):
+    """Get articles with a specific importance level."""
+    try:
+        # Validate importance level
+        if importance_level not in [level.value for level in ImportanceLevel]:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid importance level. Must be one of: {', '.join([level.value for level in ImportanceLevel])}"
+            )
+            
+        # Get articles by importance level
+        articles = await storage.get_articles_by_importance(importance_level, limit)
+        return [article.to_dict() for article in articles]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving articles for importance level '{importance_level}': {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.get("/api/articles/search", response_model=List[Dict[str, Any]])
@@ -154,6 +178,17 @@ async def get_article_categories(
         return await storage.get_category_counts()
     except Exception as e:
         logger.error(f"Error retrieving article categories: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@app.get("/api/importance/counts", response_model=Dict[str, int])
+async def get_importance_level_counts(
+    storage: NewsStorageAgent = Depends(get_storage_agent)
+):
+    """Get count of articles by importance level."""
+    try:
+        return await storage.get_importance_counts()
+    except Exception as e:
+        logger.error(f"Error retrieving importance level counts: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.get("/api/articles/recent", response_model=List[Dict[str, Any]])

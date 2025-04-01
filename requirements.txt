@@ -1,5 +1,11 @@
 # Add project dependencies here
 aiohttp>=3.9.0
+aiofiles
+
+trafilatura>=2.0.0
+readability>=0.3.2
+readability-lxml
+
 beautifulsoup4>=4.12.0
 lxml[html_clean]>=5.0.0  # Ensure the cleaner is installed
 lxml_html_clean>=0.4.1
