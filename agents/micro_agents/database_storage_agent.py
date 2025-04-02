@@ -135,6 +135,12 @@ class DatabaseStorageAgent(BaseAgent):
             return await self._get_database_stats(task)
         elif task_type == "cleanup_old_articles":
             return await self._cleanup_old_articles(task)
+        elif task_type == "store_fallback_source":
+            return await self._store_fallback_source(task)
+        elif task_type == "get_fallback_sources_by_location":
+            return await self._get_fallback_sources_by_location(task)
+        elif task_type == "update_fallback_source_metrics":
+            return await self._update_fallback_source_metrics(task)
         else:
             raise ValueError(f"Unknown task type: {task_type}")
             
@@ -377,6 +383,25 @@ class DatabaseStorageAgent(BaseAgent):
                     content_rowid='rowid'
                 )
             ''')
+            
+            # Create fallback sources table for dynamic source management
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS fallback_sources (
+                    url TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    location_type TEXT,
+                    reliability_score REAL DEFAULT 0.5,
+                    location_pattern TEXT NOT NULL,
+                    priority INTEGER DEFAULT 5,
+                    last_verified TIMESTAMP,
+                    verified_count INTEGER DEFAULT 0,
+                    added_at TIMESTAMP
+                )
+            ''')
+            
+            # Create index for fallback sources
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_fallback_location_pattern ON fallback_sources(location_pattern)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_fallback_priority ON fallback_sources(priority)')
             
             # Triggers to keep FTS index updated
             await conn.execute('''
@@ -1309,3 +1334,204 @@ class DatabaseStorageAgent(BaseAgent):
             return datetime.fromisoformat(dt_str)
         except (ValueError, AttributeError):
             return None
+            
+    async def _store_fallback_source(self, task: Task) -> bool:
+        """Store a news source in the fallback sources database"""
+        source_data = task.data.get("source")
+        if not source_data:
+            raise ValueError("Source data is required")
+            
+        source = (
+            source_data if isinstance(source_data, NewsSource) 
+            else NewsSource(**source_data)
+        )
+        
+        location_pattern = task.data.get("location_pattern", "")
+        if not location_pattern:
+            raise ValueError("Location pattern is required for fallback sources")
+            
+        if not source.url:
+            logger.warning("Attempted to store fallback source with no URL")
+            return False
+            
+        # Update source with current timestamp
+        now = datetime.now(timezone.utc).isoformat()
+            
+        query = '''
+            INSERT OR REPLACE INTO fallback_sources 
+            (url, name, location_type, reliability_score, location_pattern,
+             priority, last_verified, verified_count, added_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        '''
+        
+        try:
+            # Use priority from task or default to 10
+            priority = task.data.get("priority", 10)
+            
+            # Get verified count or default to 1
+            verified_count = task.data.get("verified_count", 1)
+            
+            await self._execute_query(
+                query, 
+                (
+                    source.url,
+                    source.name,
+                    source.location_type,
+                    source.reliability_score,
+                    location_pattern,
+                    priority,
+                    now,
+                    verified_count,
+                    now
+                ),
+                None  # Execute only
+            )
+            
+            # Invalidate relevant cache entries
+            self._invalidate_cache_pattern("fallback_sources_")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error storing fallback source {source.url}: {e}", exc_info=True)
+            return False
+            
+    async def _get_fallback_sources_by_location(self, task: Task) -> List[NewsSource]:
+        """Get fallback news sources for a specific location pattern"""
+        location = task.data.get("location", "")
+        if not location:
+            raise ValueError("Location is required")
+            
+        limit = task.data.get("limit", 10)
+        
+        # Check cache
+        location_lower = location.lower()
+        cache_key = f"fallback_sources_{location_lower}_{limit}"
+        cached_result = self._get_from_cache(cache_key)
+        if cached_result:
+            return cached_result
+            
+        # First try exact match on location pattern
+        query = '''
+            SELECT url, name, location_type, reliability_score, location_pattern,
+                   priority, verified_count
+            FROM fallback_sources
+            WHERE location_pattern = ?
+            ORDER BY priority ASC, verified_count DESC, reliability_score DESC
+            LIMIT ?
+        '''
+        
+        try:
+            rows = await self._execute_query(query, (location_lower, limit), 'all')
+            
+            # If no exact matches, try substring matches
+            if not rows:
+                # Create a list of terms to check for partial matches
+                location_terms = location_lower.split()
+                
+                # If we have multiple terms, try searching for each term
+                if len(location_terms) > 1:
+                    placeholders = ', '.join(['?'] * len(location_terms))
+                    query = f'''
+                        SELECT url, name, location_type, reliability_score, location_pattern,
+                               priority, verified_count
+                        FROM fallback_sources
+                        WHERE location_pattern IN ({placeholders})
+                        ORDER BY priority ASC, verified_count DESC, reliability_score DESC
+                        LIMIT ?
+                    '''
+                    # Add limit as the last parameter
+                    params = tuple(location_terms) + (limit,)
+                    rows = await self._execute_query(query, params, 'all')
+                
+                # If still no results, try LIKE queries for partial matches
+                if not rows:
+                    like_params = []
+                    like_clauses = []
+                    
+                    # Try pattern matching with longer terms first
+                    for term in location_terms:
+                        if len(term) > 3:  # Only use longer terms
+                            like_clauses.append("location_pattern LIKE ?")
+                            like_params.append(f"%{term}%")
+                    
+                    if like_clauses:
+                        query = f'''
+                            SELECT url, name, location_type, reliability_score, location_pattern,
+                                   priority, verified_count
+                            FROM fallback_sources
+                            WHERE {" OR ".join(like_clauses)}
+                            ORDER BY priority ASC, verified_count DESC, reliability_score DESC
+                            LIMIT ?
+                        '''
+                        # Add limit as the last parameter
+                        like_params.append(limit)
+                        rows = await self._execute_query(query, tuple(like_params), 'all')
+            
+            # If still no results, get generic fallback sources (location_pattern = 'global')
+            if not rows:
+                query = '''
+                    SELECT url, name, location_type, reliability_score, location_pattern,
+                           priority, verified_count 
+                    FROM fallback_sources
+                    WHERE location_pattern = 'global'
+                    ORDER BY priority ASC, verified_count DESC, reliability_score DESC
+                    LIMIT ?
+                '''
+                rows = await self._execute_query(query, (limit,), 'all')
+            
+            # If all else fails, get top sources regardless of location
+            if not rows:
+                query = '''
+                    SELECT url, name, location_type, reliability_score, location_pattern,
+                           priority, verified_count
+                    FROM fallback_sources
+                    ORDER BY verified_count DESC, reliability_score DESC
+                    LIMIT ?
+                '''
+                rows = await self._execute_query(query, (limit,), 'all')
+            
+            # Convert rows to NewsSource objects
+            sources = []
+            for row in rows:
+                source = NewsSource(
+                    url=row.get('url'),
+                    name=row.get('name'),
+                    location_type=row.get('location_type', 'Unknown'),
+                    reliability_score=float(row.get('reliability_score', 0.5))
+                )
+                sources.append(source)
+                
+            # Cache the results
+            self._add_to_cache(cache_key, sources)
+                
+            return sources
+            
+        except Exception as e:
+            logger.error(f"Error retrieving fallback sources for location '{location}': {e}", exc_info=True)
+            return []
+    
+    async def _update_fallback_source_metrics(self, task: Task) -> bool:
+        """Update metrics for a fallback source when it's successfully verified"""
+        url = task.data.get("url")
+        if not url:
+            raise ValueError("URL is required")
+        
+        try:
+            query = '''
+                UPDATE fallback_sources
+                SET verified_count = verified_count + 1,
+                    last_verified = ?
+                WHERE url = ?
+            '''
+            
+            now = datetime.now(timezone.utc).isoformat()
+            await self._execute_query(query, (now, url), None)
+            
+            # Invalidate cache
+            self._invalidate_cache_pattern("fallback_sources_")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error updating fallback source metrics for {url}: {e}", exc_info=True)
+            return False

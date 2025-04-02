@@ -175,22 +175,34 @@ class RSSDiscoveryAgent(BaseAgent):
         return discovered_feeds
     
     async def _validate_feed(self, feed_url: str) -> bool:
-        """Validate if a URL is a valid RSS/Atom feed"""
+        """Validate if a URL is a valid RSS/Atom feed with enhanced content-type checking"""
         try:
             async with self._session.get(feed_url, timeout=10) as response:
                 if response.status != 200:
                     return False
                 
-                # Check content type
+                # Check content type - RSS feeds should be XML
                 content_type = response.headers.get('Content-Type', '').lower()
-                if not any(ct in content_type for ct in ['xml', 'rss', 'atom']):
-                    # Some feeds don't set the correct content type, so still parse the content
-                    pass
+                is_valid_content_type = any(ct in content_type for ct in [
+                    'xml', 'rss', 'atom', 'application/rss', 'application/atom', 
+                    'application/xml', 'text/xml', 'application/rss+xml', 'application/atom+xml'
+                ])
                 
-                # Try to parse as XML
-                content = await response.text()
+                # If content type doesn't look like XML, this likely isn't a feed
+                if not is_valid_content_type and 'html' in content_type:
+                    return False
+                
+                # Get the first chunk of content to validate
+                content_sample = await response.content.read(4096)
                 try:
-                    root = ET.fromstring(content)
+                    content_text = content_sample.decode('utf-8', errors='ignore')
+                    
+                    # Quick check if it looks like XML before trying to parse
+                    if not content_text.strip().startswith('<?xml') and not content_text.strip().startswith('<rss') and not content_text.strip().startswith('<feed'):
+                        return False
+                        
+                    # Try to parse as XML to validate
+                    root = ET.fromstring(content_text)
                     
                     # Check for RSS or Atom elements
                     is_rss = root.tag == 'rss' or root.find('./channel') is not None

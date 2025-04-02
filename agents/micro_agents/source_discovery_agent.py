@@ -9,7 +9,7 @@ from typing import List, Dict, Any, Optional, Set, Tuple, cast
 from urllib.parse import urlparse
 from pathlib import Path
 import aiofiles
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from collections import defaultdict
 import random
 from datetime import datetime, timedelta
@@ -50,6 +50,9 @@ class SourceDiscoveryAgent(BaseAgent):
         # Domain verification cache
         self._domain_verification_cache: Dict[str, Dict[str, Any]] = {}
         self._domain_cache_timestamps: Dict[str, float] = {}
+        
+        # Verification metadata store (instead of setting attributes directly on NewsSource objects)
+        self._source_verification_metadata: Dict[str, Dict[str, Any]] = {}  # source_id -> verification metadata
         
         # Validation patterns
         self._news_content_patterns = [
@@ -123,8 +126,46 @@ class SourceDiscoveryAgent(BaseAgent):
             return await self._verify_source(task)
         elif task_type == "bulk_verify_sources":
             return await self._bulk_verify_sources(task)
+        elif task_type == "store_fallback_source":
+            return await self._store_fallback_source(task)
         else:
             raise ValueError(f"Unknown task type: {task_type}")
+            
+    async def _store_fallback_source(self, task: Task) -> bool:
+        """Store a verified source in the fallback database for future reuse"""
+        source_data = task.data.get("source")
+        if not source_data:
+            raise ValueError("Source data is required")
+            
+        location = task.data.get("location", "")
+        if not location:
+            raise ValueError("Location is required for fallback source storage")
+            
+        try:
+            # Create a task for the database storage agent
+            db_task = Task(
+                task_id=f"store_fallback_{time.time()}",
+                task_type="store_fallback_source",
+                data={
+                    "source": source_data,
+                    "location_pattern": location.lower(),
+                    "priority": task.data.get("priority", 10),
+                    "verified_count": task.data.get("verified_count", 1)
+                }
+            )
+            
+            # Get the task manager from parent system
+            task_manager = task.data.get("task_manager")
+            if task_manager:
+                # Submit task to the task manager
+                return await task_manager.create_task("store_fallback_source", db_task.data, TaskPriority.LOW)
+            else:
+                logger.warning("No task manager available for storing fallback source")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error storing fallback source: {e}")
+            return False
             
     async def _discover_sources(self, task: Task) -> List[NewsSource]:
         """
@@ -174,7 +215,7 @@ class SourceDiscoveryAgent(BaseAgent):
                 logger.warning(f"Failed to generate sources via LLM for {location}: {str(e)}")
         
         # Always get fallback sources to ensure we have a minimum set
-        fallback_sources = self._create_fallback_sources(location)
+        fallback_sources = await self._create_fallback_sources(location)
         sources_from_fallback = fallback_sources
         
         # Combine sources ensuring no duplicates
@@ -197,6 +238,32 @@ class SourceDiscoveryAgent(BaseAgent):
         # Update cache with the validated sources
         if verified_sources:
             await self._update_source_cache(location, verified_sources)
+            
+            # Save verified sources to fallback database for future use
+            # This makes our system learn and improve over time
+            task_manager = getattr(self, "task_manager", None)
+            if task_manager:
+                try:
+                    # Store only high-quality sources in fallback database
+                    for source in verified_sources:
+                        if source.reliability_score >= 0.7:  # Only store reliable sources
+                            source_id = self._get_source_id(source)
+                            verification_metadata = self._source_verification_metadata.get(source_id, {})
+                            
+                            # Add source to fallback database with proper metadata
+                            await self._store_fallback_source(Task(
+                                task_id=f"fallback_store_{source_id}",
+                                task_type="store_fallback_source",
+                                data={
+                                    "source": source,
+                                    "location": location,
+                                    "task_manager": task_manager,
+                                    "priority": 5 if source.location_type == "Local" else 8,
+                                    "verified_count": 1
+                                }
+                            ))
+                except Exception as e:
+                    logger.warning(f"Error storing sources in fallback database: {e}")
         
         # Log metrics
         discovery_time = time.monotonic() - discovery_start
@@ -404,21 +471,25 @@ class SourceDiscoveryAgent(BaseAgent):
             
         async def verify_source_wrapper(source: NewsSource) -> Tuple[bool, NewsSource]:
             try:
+                # Properly handle dataclass conversion
+                source_data = asdict(source) if is_dataclass(source) else source
                 result = await self._verify_source(Task(
                     task_id=f"verify_{self._get_source_id(source)}",
                     task_type="verify_source",
-                    data={"source": asdict(source) if hasattr(source, "__dict__") else source}
+                    data={"source": source_data}
                 ))
                 
                 if result and result.get("verified", False):
-                    # Update source with additional metadata
+                    # Update source name if site_name is available
                     if "site_name" in result and result["site_name"]:
                         source.name = result["site_name"]
                         
-                    # Enhance source with verification data
-                    # We maintain this info in memory only - not serialized
-                    setattr(source, "verified", True)
-                    setattr(source, "last_verified", datetime.now().timestamp())
+                    # Store verification metadata in our dictionary instead of on the object
+                    source_id = self._get_source_id(source)
+                    self._source_verification_metadata[source_id] = {
+                        "verified": True,
+                        "last_verified": datetime.now().timestamp()
+                    }
                     
                     # Ensure reliability score is reasonable if we have latency data
                     if source.reliability_score < 0.4 and result.get("latency", 10) < 2:
@@ -578,138 +649,62 @@ class SourceDiscoveryAgent(BaseAgent):
             logger.error(f"Error generating sources via LLM for {location}: {str(e)}", exc_info=True)
             return []
     
-    def _create_fallback_sources(self, location: str) -> List[NewsSource]:
-        """Create a fallback list of news sources with improved coverage and reliability"""
-        fallback_sources = []
-        location_lower = location.lower()
-        
-        # Check for specific locations with expanded coverage
-        if any(loc in location_lower for loc in ["nyc", "new york", "new york city"]):
-            fallback_sources = [
-                NewsSource(name="New York Times", url="https://www.nytimes.com/", location_type="National/Local", reliability_score=0.9),
-                NewsSource(name="New York Post", url="https://nypost.com/", location_type="Local", reliability_score=0.7),
-                NewsSource(name="NY1", url="https://www.ny1.com/", location_type="Local", reliability_score=0.8),
-                NewsSource(name="Gothamist", url="https://gothamist.com/", location_type="Local", reliability_score=0.8),
-                NewsSource(name="amNY", url="https://www.amny.com/", location_type="Local", reliability_score=0.7),
-                NewsSource(name="New York Daily News", url="https://www.nydailynews.com/", location_type="Local", reliability_score=0.7),
-                NewsSource(name="WNYC", url="https://www.wnyc.org/", location_type="Local", reliability_score=0.85)
-            ]
-        elif any(loc in location_lower for loc in ["la", "los angeles"]):
-            fallback_sources = [
-                NewsSource(name="Los Angeles Times", url="https://www.latimes.com/", location_type="National/Local", reliability_score=0.9),
-                NewsSource(name="LA Daily News", url="https://www.dailynews.com/", location_type="Local", reliability_score=0.8),
-                NewsSource(name="LAist", url="https://laist.com/", location_type="Local", reliability_score=0.8),
-                NewsSource(name="KTLA", url="https://ktla.com/", location_type="Local", reliability_score=0.75),
-                NewsSource(name="LA Weekly", url="https://www.laweekly.com/", location_type="Local", reliability_score=0.7)
-            ]
-        elif "chicago" in location_lower:
-            fallback_sources = [
-                NewsSource(name="Chicago Tribune", url="https://www.chicagotribune.com/", location_type="National/Local", reliability_score=0.9),
-                NewsSource(name="Chicago Sun-Times", url="https://chicago.suntimes.com/", location_type="Local", reliability_score=0.8),
-                NewsSource(name="Block Club Chicago", url="https://blockclubchicago.org/", location_type="Local", reliability_score=0.8),
-                NewsSource(name="WBEZ Chicago", url="https://www.wbez.org/", location_type="Local", reliability_score=0.85),
-                NewsSource(name="Crain's Chicago Business", url="https://www.chicagobusiness.com/", location_type="Local", reliability_score=0.75)
-            ]
-        elif "london" in location_lower:
-            fallback_sources = [
-                NewsSource(name="BBC London", url="https://www.bbc.co.uk/news/england/london", location_type="Local", reliability_score=0.9),
-                NewsSource(name="Evening Standard", url="https://www.standard.co.uk/", location_type="Local", reliability_score=0.8),
-                NewsSource(name="The Guardian London", url="https://www.theguardian.com/uk/london", location_type="Local", reliability_score=0.9),
-                NewsSource(name="Time Out London", url="https://www.timeout.com/london/news", location_type="Local", reliability_score=0.7),
-                NewsSource(name="MyLondon", url="https://www.mylondon.news/", location_type="Local", reliability_score=0.6)
-            ]
-        elif "tokyo" in location_lower:
-            fallback_sources = [
-                NewsSource(name="The Japan Times", url="https://www.japantimes.co.jp/", location_type="National/Local", reliability_score=0.8),
-                NewsSource(name="Tokyo Weekender", url="https://www.tokyoweekender.com/", location_type="Local", reliability_score=0.7),
-                NewsSource(name="NHK World", url="https://www3.nhk.or.jp/nhkworld/", location_type="National", reliability_score=0.9),
-                NewsSource(name="Tokyo Reporter", url="https://www.tokyoreporter.com/", location_type="Local", reliability_score=0.6),
-                NewsSource(name="Asahi Shimbun", url="https://www.asahi.com/ajw/", location_type="National", reliability_score=0.85)
-            ]
-        elif "sydney" in location_lower or "australia" in location_lower:
-            fallback_sources = [
-                NewsSource(name="Sydney Morning Herald", url="https://www.smh.com.au/", location_type="Local", reliability_score=0.85),
-                NewsSource(name="The Australian", url="https://www.theaustralian.com.au/", location_type="National", reliability_score=0.8),
-                NewsSource(name="ABC News Australia", url="https://www.abc.net.au/news/", location_type="National", reliability_score=0.9),
-                NewsSource(name="The Daily Telegraph", url="https://www.dailytelegraph.com.au/", location_type="Local", reliability_score=0.7),
-                NewsSource(name="SBS News", url="https://www.sbs.com.au/news/", location_type="National", reliability_score=0.85)
-            ]
-        elif "toronto" in location_lower or "canada" in location_lower:
-            fallback_sources = [
-                NewsSource(name="Toronto Star", url="https://www.thestar.com/", location_type="Local", reliability_score=0.85),
-                NewsSource(name="CBC Toronto", url="https://www.cbc.ca/news/canada/toronto", location_type="Local", reliability_score=0.9),
-                NewsSource(name="Globe and Mail", url="https://www.theglobeandmail.com/", location_type="National", reliability_score=0.85),
-                NewsSource(name="CTV News Toronto", url="https://toronto.ctvnews.ca/", location_type="Local", reliability_score=0.8),
-                NewsSource(name="National Post", url="https://nationalpost.com/", location_type="National", reliability_score=0.8)
-            ]
-        elif "paris" in location_lower or "france" in location_lower:
-            fallback_sources = [
-                NewsSource(name="Le Monde", url="https://www.lemonde.fr/", location_type="National", reliability_score=0.9),
-                NewsSource(name="France24", url="https://www.france24.com/en/", location_type="National", reliability_score=0.85),
-                NewsSource(name="Le Figaro", url="https://www.lefigaro.fr/", location_type="National", reliability_score=0.8),
-                NewsSource(name="The Local France", url="https://www.thelocal.fr/", location_type="Local", reliability_score=0.7),
-                NewsSource(name="Libération", url="https://www.liberation.fr/", location_type="National", reliability_score=0.8)
-            ]
-        elif any(city in location_lower for city in ["berlin", "munich", "germany"]):
-            fallback_sources = [
-                NewsSource(name="Deutsche Welle", url="https://www.dw.com/en/", location_type="National", reliability_score=0.9),
-                NewsSource(name="Der Spiegel", url="https://www.spiegel.de/international/", location_type="National", reliability_score=0.85),
-                NewsSource(name="Berliner Zeitung", url="https://www.berliner-zeitung.de/", location_type="Local", reliability_score=0.8),
-                NewsSource(name="The Local Germany", url="https://www.thelocal.de/", location_type="Local", reliability_score=0.75),
-                NewsSource(name="Deutsche Presse-Agentur", url="https://www.dpa.com/en/", location_type="National", reliability_score=0.9)
-            ]
-        elif "india" in location_lower or any(city in location_lower for city in ["delhi", "mumbai", "bangalore"]):
-            fallback_sources = [
-                NewsSource(name="The Hindu", url="https://www.thehindu.com/", location_type="National", reliability_score=0.85),
-                NewsSource(name="Times of India", url="https://timesofindia.indiatimes.com/", location_type="National", reliability_score=0.75),
-                NewsSource(name="NDTV", url="https://www.ndtv.com/", location_type="National", reliability_score=0.8),
-                NewsSource(name="Hindustan Times", url="https://www.hindustantimes.com/", location_type="National", reliability_score=0.8),
-                NewsSource(name="India Today", url="https://www.indiatoday.in/", location_type="National", reliability_score=0.75)
-            ]
-        elif "mexico" in location_lower or "mexico city" in location_lower:
-            fallback_sources = [
-                NewsSource(name="El Universal", url="https://www.eluniversal.com.mx/", location_type="National", reliability_score=0.8),
-                NewsSource(name="Reforma", url="https://www.reforma.com/", location_type="National", reliability_score=0.8),
-                NewsSource(name="Mexico News Daily", url="https://mexiconewsdaily.com/", location_type="National", reliability_score=0.75),
-                NewsSource(name="La Jornada", url="https://www.jornada.com.mx/", location_type="National", reliability_score=0.7),
-                NewsSource(name="El Financiero", url="https://www.elfinanciero.com.mx/", location_type="National", reliability_score=0.75)
-            ]
-        else:
-            # Generic global sources for any location
+    async def _create_fallback_sources(self, location: str) -> List[NewsSource]:
+        """
+        Get fallback sources from the database instead of hardcoded values,
+        falling back to a few global sources only if necessary
+        """
+        try:
+            # Get the task manager from our task context or use a direct connection
+            task_manager = getattr(self, "task_manager", None)
+            db_task_id = None
+            
+            if task_manager:
+                # Create a task to get fallback sources from database
+                db_task_id = await task_manager.create_task(
+                    "get_fallback_sources_by_location", 
+                    {
+                        "location": location.lower(),
+                        "limit": 10
+                    },
+                    TaskPriority.HIGH  # High priority since this is needed right away
+                )
+                
+                # Wait for results with a timeout to prevent blocking
+                try:
+                    fallback_sources = await asyncio.wait_for(
+                        task_manager.get_task_result(db_task_id),
+                        timeout=10  # 10 second timeout
+                    )
+                    
+                    if fallback_sources and len(fallback_sources) > 0:
+                        logger.info(f"Found {len(fallback_sources)} fallback sources from database for {location}")
+                        return fallback_sources
+                
+                except (asyncio.TimeoutError, Exception) as e:
+                    error_type = "timeout" if isinstance(e, asyncio.TimeoutError) else str(e)
+                    logger.warning(f"Error getting fallback sources from database: {error_type}")
+            
+            # If we get here, we need to use a minimal set of global sources as a last resort
+            # These should rarely be used as the database will populate over time
             global_sources = [
-                NewsSource(name="BBC News", url="https://www.bbc.com/news", location_type="International", reliability_score=0.9),
                 NewsSource(name="Reuters", url="https://www.reuters.com/", location_type="International", reliability_score=0.95),
                 NewsSource(name="Associated Press", url="https://apnews.com/", location_type="International", reliability_score=0.95),
-                NewsSource(name="Al Jazeera", url="https://www.aljazeera.com/", location_type="International", reliability_score=0.8),
-                NewsSource(name="The Guardian", url="https://www.theguardian.com/", location_type="International", reliability_score=0.85)
+                NewsSource(name="BBC News", url="https://www.bbc.com/news", location_type="International", reliability_score=0.9),
+                NewsSource(name="Al Jazeera", url="https://www.aljazeera.com/", location_type="International", reliability_score=0.85),
+                NewsSource(name="The Guardian", url="https://www.theguardian.com/", location_type="International", reliability_score=0.9)
             ]
             
-            # US-specific sources for US locations
-            us_location_indicators = ["usa", "united states", "america", "us ", " us"]
-            us_states = [
-                "alabama", "alaska", "arizona", "arkansas", "california", "colorado", "connecticut", 
-                "delaware", "florida", "georgia", "hawaii", "idaho", "illinois", "indiana", "iowa", 
-                "kansas", "kentucky", "louisiana", "maine", "maryland", "massachusetts", "michigan", 
-                "minnesota", "mississippi", "missouri", "montana", "nebraska", "nevada", "new hampshire", 
-                "new jersey", "new mexico", "new york", "north carolina", "north dakota", "ohio", "oklahoma", 
-                "oregon", "pennsylvania", "rhode island", "south carolina", "south dakota", "tennessee", 
-                "texas", "utah", "vermont", "virginia", "washington", "west virginia", "wisconsin", "wyoming"
+            logger.info(f"Using {len(global_sources)} global fallback sources for {location} (database unavailable)")
+            return global_sources
+            
+        except Exception as e:
+            logger.error(f"Error creating fallback sources: {e}")
+            # Absolute minimum fallback in case of total failure
+            return [
+                NewsSource(name="Reuters", url="https://www.reuters.com/", location_type="International", reliability_score=0.95),
+                NewsSource(name="BBC News", url="https://www.bbc.com/news", location_type="International", reliability_score=0.9)
             ]
-            
-            if any(indicator in location_lower for indicator in us_location_indicators) or any(state in location_lower for state in us_states):
-                us_sources = [
-                    NewsSource(name="CNN", url="https://www.cnn.com/", location_type="National", reliability_score=0.8),
-                    NewsSource(name="The New York Times", url="https://www.nytimes.com/", location_type="National", reliability_score=0.9),
-                    NewsSource(name="The Washington Post", url="https://www.washingtonpost.com/", location_type="National", reliability_score=0.85),
-                    NewsSource(name="NBC News", url="https://www.nbcnews.com/", location_type="National", reliability_score=0.8),
-                    NewsSource(name="USA Today", url="https://www.usatoday.com/", location_type="National", reliability_score=0.75)
-                ]
-                fallback_sources = us_sources + global_sources
-            else:
-                fallback_sources = global_sources
-            
-        logger.info(f"Created {len(fallback_sources)} fallback sources for {location}")
-        return fallback_sources
     
     def _extract_page_metadata(self, html_content: str, url: str) -> Dict[str, Any]:
         """
@@ -905,17 +900,17 @@ class SourceDiscoveryAgent(BaseAgent):
             if location_lower in name_lower or location_lower in domain:
                 score += 0.3  # Big boost for location-specific sources
             
-            # Check for previous verification success
-            verification_bonus = 0
-            if hasattr(source, "verified") and getattr(source, "verified"):
+            # Check for previous verification success using our metadata store
+            verification_metadata = self._source_verification_metadata.get(source_id, {})
+            if verification_metadata.get("verified", False):
                 verification_bonus = 0.2
                 
                 # Extra bonus for recently verified sources
-                last_verified = getattr(source, "last_verified", 0)
+                last_verified = verification_metadata.get("last_verified", 0)
                 if last_verified and time.time() - last_verified < 86400:  # Within 24 hours
                     verification_bonus += 0.1
                     
-            score += verification_bonus
+                score += verification_bonus
             
             # Apply any cached rank score if available
             if source_id in self._source_rank_scores:
@@ -1022,13 +1017,17 @@ class SourceDiscoveryAgent(BaseAgent):
             # Convert to serializable format
             serialized_sources = []
             for source in sources:
+                source_id = self._get_source_id(source)
+                # Get verification metadata from our store
+                verification_metadata = self._source_verification_metadata.get(source_id, {})
+                
                 serialized_sources.append({
                     "name": source.name,
                     "url": source.url,
                     "location_type": source.location_type,
                     "reliability_score": source.reliability_score,
-                    "verified": getattr(source, "verified", False),
-                    "last_verified": getattr(source, "last_verified", None)
+                    "verified": verification_metadata.get("verified", False),
+                    "last_verified": verification_metadata.get("last_verified", None)
                 })
                 
             cache_data = {
